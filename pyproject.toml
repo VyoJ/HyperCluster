@@ -1,0 +1,17 @@
+[project]
+name = "hypercluster-v0-1"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "iroh>=0.35.0",
+    "psutil>=7.0.0",
+    "py-cpuinfo>=9.0.0",
+    "rich>=14.0.0",
+    "tomlkit>=0.13.3",
+    "typer>=0.16.0",
+    "wmi>=1.5.1",
+    "transformers>=4.41.2",
+    "torch>=2.3.1",
+]
