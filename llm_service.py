@@ -20,7 +20,7 @@ class LLMMessageType(Enum):
 class LLMService:
     """Manages LLM functionality in the P2P network"""
 
-    def __init__(self, network, model_name="HuggingFaceTB/SmolLM-135M"):
+    def __init__(self, network, model_name="Qwen/Qwen3-0.6B"):
         """Initialize LLM service"""
         self.network = network  # This is the Node object
         self.model_name = model_name
