@@ -171,9 +171,9 @@ class TransformersShardedInferenceEngine(InferenceEngine):
             # Get cache state
             cache_state = self.caches.get(request_id, None)
 
-            # Prepare inputs based on shard position
-            if self.shard.is_first_layer():
-                # First shard: expects input_ids
+            # Prepare inputs based on shard position and input shape
+            if self.shard.is_first_layer() and input_tensor.dim() <= 2:
+                # First shard: expects input_ids (2D: batch_size x seq_len)
                 if input_tensor.dim() == 1:
                     input_tensor = input_tensor.unsqueeze(0)  # Add batch dimension
 

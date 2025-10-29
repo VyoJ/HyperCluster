@@ -51,6 +51,10 @@ async def message_handler(message: dict):
             peer_capabilities = DeviceCapabilities.from_dict(peer_capabilities_dict)
             node.topology.update_node(sender_id, peer_capabilities)
             console.print(f"[dim]Updated topology: {sender_id[:16]}... - {peer_capabilities.memory:.1f} GB[/dim]")
+            
+            # Re-initialize ring pipeline if LLM service is running in ring mode
+            if llm_service and llm_service.is_running and llm_service.use_ring:
+                asyncio.create_task(llm_service.on_topology_update())
     elif msg_type == "llm_service_info":
         llm_nodes[sender_id] = payload
         console.print(f"[magenta]LLM service discovered from {sender_id}[/magenta]")

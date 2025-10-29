@@ -549,6 +549,37 @@ class LLMService:
                 model_total_layers=self.current_shard.n_layers
             )
 
+    async def on_topology_update(self):
+        """Handle topology updates - re-initialize ring if nodes join/leave."""
+        if not self.use_ring or not self.ring_coordinator or not self.is_running:
+            return
+        
+        logger.info("")
+        logger.info("=" * 80)
+        logger.info("🔄 TOPOLOGY UPDATE DETECTED - RE-INITIALIZING RING")
+        logger.info("=" * 80)
+        
+        # Get updated topology
+        topology_nodes = self.network.topology.all_nodes()
+        logger.info(f"New topology size: {len(topology_nodes)} nodes")
+        
+        if not topology_nodes:
+            logger.warning("Topology update resulted in empty topology, keeping current ring")
+            return
+        
+        # Re-initialize ring with new topology
+        my_node_id = str(await self.network.iroh_node.net().node_id())
+        
+        try:
+            await self.ring_coordinator.initialize_ring(
+                topology_nodes=topology_nodes,
+                my_node_id=my_node_id,
+                model_total_layers=self.current_shard.n_layers
+            )
+            logger.info("Ring re-initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to re-initialize ring: {e}", exc_info=True)
+
     async def _process_query_ring(self, query_id: str, query: str):
         """Process query using ring pipeline."""
         try:
