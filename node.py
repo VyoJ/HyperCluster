@@ -390,3 +390,47 @@ class Node:
         }
 
         await self.broadcast_message(message)
+
+    async def handle_ring_tensor_message(self, message_data: Dict, llm_service):
+        """
+        Handle incoming ring tensor forward message.
+        
+        This processes tensors forwarded from the previous node in the ring
+        and passes them to the ring coordinator for processing.
+        """
+        try:
+            sender_id = message_data.get("sender_id")
+            payload = message_data.get("payload", {})
+            request_id = payload.get("request_id", "unknown")
+            
+            logger.debug(f"Handling ring tensor from {sender_id[:8] if sender_id else 'unknown'}")
+            
+            # Deserialize tensor
+            import base64
+            tensor_b64 = payload.get("tensor_data", "")
+            if not tensor_b64:
+                logger.error("No tensor data in ring message")
+                return
+                
+            tensor_bytes = base64.b64decode(tensor_b64)
+            tensor_shape = tuple(payload.get("tensor_shape", []))
+            tensor_dtype = np.dtype(payload.get("tensor_dtype", "float32"))
+            is_final = payload.get("is_final", False)
+            
+            # Reconstruct tensor
+            tensor = np.frombuffer(tensor_bytes, dtype=tensor_dtype).reshape(tensor_shape)
+            
+            # Pass to ring coordinator if available
+            if llm_service and llm_service.ring_coordinator:
+                await llm_service.ring_coordinator.handle_incoming_tensor(
+                    sender_id=sender_id,
+                    request_id=request_id,
+                    tensor_data=tensor,
+                    shard=llm_service.current_shard,
+                    is_final=is_final
+                )
+            else:
+                logger.warning("No ring coordinator available to handle tensor")
+        
+        except Exception as e:
+            logger.error(f"Error handling ring tensor: {e}", exc_info=True)

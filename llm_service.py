@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 from shard import Shard
 from transformers_inference import TransformersShardedInferenceEngine
+from ring_pipeline import RingPipelineCoordinator
 
 logger = logging.getLogger(__name__)
 
@@ -24,16 +25,20 @@ class LLMService:
     """Manages LLM functionality in the P2P network with sharded inference support"""
 
     def __init__(
-        self, network, model_name="Qwen/Qwen2.5-0.5B-Instruct", use_sharding=True
+        self, network, model_name="Qwen/Qwen2.5-0.5B-Instruct", use_sharding=True, use_ring=False
     ):
         """Initialize LLM service"""
         self.network = network  # This is the Node object
         self.model_name = model_name
         self.use_sharding = use_sharding
+        self.use_ring = use_ring  # Enable ring pipeline mode
 
         # Sharded inference engine
         self.inference_engine: Optional[TransformersShardedInferenceEngine] = None
         self.current_shard: Optional[Shard] = None
+
+        # Ring pipeline coordinator
+        self.ring_coordinator: Optional[RingPipelineCoordinator] = None
 
         # Legacy single-node support
         self.model = None
@@ -67,6 +72,10 @@ class LLMService:
             if self.use_sharding:
                 # Initialize sharded inference engine
                 await self._init_sharded_inference(num_layers)
+                
+                # Initialize ring pipeline if enabled
+                if self.use_ring:
+                    await self._init_ring_pipeline()
             else:
                 # Legacy single-node loading
                 if self.is_bitnet:
@@ -187,8 +196,10 @@ class LLMService:
             "timestamp": time.time(),
         }
 
-        # Use sharded or single-node inference
-        if self.use_sharding:
+        # Use ring pipeline, sharded, or single-node inference
+        if self.use_ring and self.ring_coordinator:
+            asyncio.create_task(self._process_query_ring(query_id, query))
+        elif self.use_sharding:
             asyncio.create_task(self._process_query_sharded(query_id, query))
         else:
             asyncio.create_task(self._process_query(query_id, query))
@@ -489,3 +500,93 @@ class LLMService:
         logger.warning(
             "Multi-node forwarding not yet fully implemented - this is a single-node test"
         )
+
+    async def _init_ring_pipeline(self):
+        """Initialize ring pipeline coordinator."""
+        logger.info("Initializing ring pipeline mode...")
+        
+        self.ring_coordinator = RingPipelineCoordinator(
+            inference_engine=self.inference_engine,
+            network_node=self.network
+        )
+        
+        # Wait for topology to be populated
+        topology_nodes = self.network.topology.all_nodes()
+        if not topology_nodes:
+            logger.warning("No topology nodes found, waiting for peers...")
+            await asyncio.sleep(2.0)
+            topology_nodes = self.network.topology.all_nodes()
+        
+        if topology_nodes:
+            my_node_id = str(await self.network.iroh_node.net().node_id())
+            await self.ring_coordinator.initialize_ring(
+                topology_nodes=topology_nodes,
+                my_node_id=my_node_id,
+                model_total_layers=self.current_shard.n_layers
+            )
+            logger.info(
+                f"Ring pipeline ready: rank={self.ring_coordinator.ring_position.rank}, "
+                f"layers=[{self.ring_coordinator.layer_window.layer_start}:"
+                f"{self.ring_coordinator.layer_window.layer_end}]"
+            )
+        else:
+            logger.error("Cannot initialize ring: no peers found")
+            self.use_ring = False
+
+    async def _process_query_ring(self, query_id: str, query: str):
+        """Process query using ring pipeline."""
+        try:
+            if not self.ring_coordinator or not self.ring_coordinator.ring_position:
+                logger.error("Ring coordinator not initialized")
+                return
+            
+            # Only head node starts generation
+            if self.ring_coordinator.ring_position.is_head:
+                logger.info(f"Head node starting ring inference for: {query[:50]}...")
+                
+                generated_tokens = await self.ring_coordinator.start_inference(
+                    request_id=query_id,
+                    prompt=query,
+                    shard=self.current_shard,
+                    max_tokens=self.max_generate_tokens
+                )
+                
+                # Decode tokens to text
+                response_text = await self.inference_engine.decode(
+                    self.current_shard,
+                    np.array(generated_tokens)
+                )
+                
+                result = {
+                    "llm_type": LLMMessageType.RESPONSE.value,
+                    "query_id": query_id,
+                    "query": query,
+                    "response": response_text,
+                    "tokens": generated_tokens,
+                    "model": self.model_name,
+                    "mode": "ring_pipeline",
+                    "rank": self.ring_coordinator.ring_position.rank,
+                    "processing_time": time.time() - self.pending_queries.get(query_id, {}).get("timestamp", time.time())
+                }
+                
+                await self._send_llm_data(result)
+                
+                if query_id in self.pending_queries:
+                    del self.pending_queries[query_id]
+                    
+            else:
+                # Worker nodes participate in ring but don't initiate
+                logger.info(
+                    f"Worker node (rank {self.ring_coordinator.ring_position.rank}) "
+                    f"waiting for ring messages"
+                )
+        
+        except Exception as e:
+            logger.error(f"Ring inference error: {e}", exc_info=True)
+            error_response = {
+                "llm_type": LLMMessageType.STATUS.value,
+                "query_id": query_id,
+                "status": "error",
+                "message": str(e),
+            }
+            await self._send_llm_data(error_response)

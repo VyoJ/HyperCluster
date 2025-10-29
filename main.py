@@ -39,6 +39,10 @@ async def message_handler(message: dict):
             f"\n[bold cyan][{datetime.fromtimestamp(message.get('timestamp', time.time())).strftime('%H:%M:%S')}] "
             f"[yellow]{sender_id}:[/yellow] {payload.get('content')}[/bold cyan]"
         )
+    elif msg_type == "ring_tensor_forward":
+        # Handle ring pipeline tensor messages
+        if node and llm_service:
+            await node.handle_ring_tensor_message(message, llm_service)
     elif msg_type == "llm_service_info":
         llm_nodes[sender_id] = payload
         console.print(f"[magenta]LLM service discovered from {sender_id}[/magenta]")
@@ -46,8 +50,10 @@ async def message_handler(message: dict):
         llm_payload = payload
         llm_type = llm_payload.get("llm_type")
         if llm_type == LLMMessageType.RESPONSE.value:
+            mode = llm_payload.get('mode', 'unknown')
+            rank = llm_payload.get('rank', '?')
             console.print(
-                f"\n[green]LLM Response from {sender_id}:[/green] {llm_payload.get('response')}"
+                f"\n[green]LLM Response from {sender_id} (mode={mode}, rank={rank}):[/green]\n{llm_payload.get('response')}"
             )
         elif llm_type == LLMMessageType.STATUS.value:
             console.print(
@@ -59,7 +65,7 @@ async def message_handler(message: dict):
             await llm_service.handle_llm_message(message)
 
 
-async def run_node(bootstrap_ticket: Optional[str] = None):
+async def run_node(bootstrap_ticket: Optional[str] = None, use_ring: bool = False):
     global node, llm_service, main_doc_id
 
     iroh.iroh_ffi.uniffi_set_event_loop(asyncio.get_running_loop())
@@ -88,7 +94,10 @@ async def run_node(bootstrap_ticket: Optional[str] = None):
             console.print("[red]Failed to join document.[/red]")
             return
 
-    llm_service = LLMService(node)
+    llm_service = LLMService(node, use_sharding=True, use_ring=use_ring)
+    
+    if use_ring:
+        console.print("[bold magenta]Ring pipeline mode enabled[/bold magenta]")
 
     console.print(
         f"[bold green]Node started with ID:[/bold green] [yellow]{await node.iroh_node.net().node_id()}[/yellow]"
@@ -247,18 +256,22 @@ async def handle_command(args: List[str]):
 @app.command()
 def start(
     bootstrap_ticket: Optional[str] = typer.Option(
-        None, help="Ticket of a document to join."
+        None, "--bootstrap-ticket", help="Ticket of a document to join."
+    ),
+    use_ring: bool = typer.Option(
+        False, "--ring", help="Enable ring pipeline mode for distributed inference"
     )
 ):
     """Start the Hypercluster node."""
+    mode_str = "with Ring Pipeline" if use_ring else "Standard"
     console.print(
         Panel.fit(
-            "[bold cyan]Hypercluster Node with Iroh[/bold cyan]\n"
+            f"[bold cyan]Hypercluster Node with Iroh ({mode_str})[/bold cyan]\n"
             "[green]Starting node...[/green]",
             border_style="blue",
         )
     )
-    asyncio.run(run_node(bootstrap_ticket))
+    asyncio.run(run_node(bootstrap_ticket, use_ring))
 
 
 if __name__ == "__main__":
