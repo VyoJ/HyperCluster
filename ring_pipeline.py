@@ -330,22 +330,44 @@ class RingPipelineCoordinator:
             logger.info(f"   ✅ Token {step + 1} sampled: {token_id}")
             logger.info(f"   ⏱️  Step time: {step_time*1000:.1f}ms")
             
+            # Show decoded text every 10 tokens
+            if (step + 1) % 10 == 0 or step == 0:
+                try:
+                    decoded_so_far = await self.inference_engine.decode(shard, np.array(generated_tokens))
+                    logger.info(f"   📝 Text so far: {decoded_so_far[:100]}{'...' if len(decoded_so_far) > 100 else ''}")
+                except Exception as e:
+                    logger.debug(f"Could not decode partial output: {e}")
+            
             # Check for EOS
-            # TODO: Get proper EOS token from tokenizer
-            if token_id in [2, 0]:  # Common EOS tokens
-                logger.info(f"   🛑 EOS token detected, stopping generation")
+            eos_token_id = self.inference_engine.tokenizer.eos_token_id
+            if token_id == eos_token_id:
+                logger.info(f"   🛑 EOS token ({eos_token_id}) detected, stopping generation")
                 break
             
             # Prepare for next iteration
             input_tokens = next_token.reshape(1, 1)
         
         total_time = time.time() - start_time
+        
+        # Decode the generated tokens to text
+        try:
+            decoded_text = await self.inference_engine.decode(shard, np.array(generated_tokens))
+        except Exception as e:
+            logger.error(f"Error decoding tokens: {e}")
+            decoded_text = f"[Error decoding: {e}]"
+        
         logger.info("=" * 80)
         logger.info(f"✨ GENERATION COMPLETE")
         logger.info(f"   Total tokens: {len(generated_tokens)}")
         logger.info(f"   Total time: {total_time:.2f}s")
         logger.info(f"   Avg token latency: {total_time/max(len(generated_tokens), 1)*1000:.1f}ms/token")
         logger.info("=" * 80)
+        logger.info(f"")
+        logger.info(f"📄 GENERATED TEXT:")
+        logger.info(f"{'─' * 80}")
+        logger.info(f"{decoded_text}")
+        logger.info(f"{'─' * 80}")
+        logger.info(f"")
         
         return generated_tokens
     

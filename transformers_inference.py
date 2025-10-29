@@ -67,7 +67,23 @@ class TransformersShardedInferenceEngine(InferenceEngine):
         await self.ensure_shard(shard)
 
         def _encode():
-            tokens = self.tokenizer.encode(prompt)
+            # Use chat template if available (for models like Qwen)
+            if hasattr(self.tokenizer, 'apply_chat_template'):
+                messages = [
+                    {"role": "user", "content": prompt}
+                ]
+                # Apply chat template and tokenize
+                text = self.tokenizer.apply_chat_template(
+                    messages, 
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+                tokens = self.tokenizer.encode(text, add_special_tokens=False)
+            else:
+                # Fallback to simple encoding
+                tokens = self.tokenizer.encode(prompt, add_special_tokens=True)
+            
+            logger.info(f"Encoded '{prompt[:50]}...' to {len(tokens)} tokens: {tokens[:10]}...")
             return np.array(tokens, dtype=np.int64)
 
         return await self._run_in_tokenizer_thread(_encode)
@@ -85,7 +101,20 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                     tokens_list = tokens.flatten().tolist()
             else:
                 tokens_list = [int(tokens)]
-            return self.tokenizer.decode(tokens_list)
+            
+            # Validate token IDs are in valid range
+            vocab_size = len(self.tokenizer)
+            valid_tokens = [t for t in tokens_list if 0 <= t < vocab_size]
+            if len(valid_tokens) != len(tokens_list):
+                logger.warning(f"Found {len(tokens_list) - len(valid_tokens)} invalid tokens, filtering them out")
+                tokens_list = valid_tokens
+            
+            if not tokens_list:
+                return ""
+            
+            # Decode with skip_special_tokens to get clean output
+            text = self.tokenizer.decode(tokens_list, skip_special_tokens=True)
+            return text
 
         return await self._run_in_tokenizer_thread(_decode)
 
@@ -136,7 +165,10 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                 # Greedy sampling
                 next_token = torch.argmax(logits_tensor, dim=-1, keepdim=True)
 
-            return next_token.numpy().astype(np.int32)
+            token_id = int(next_token.item())
+            logger.debug(f"Sampled token ID: {token_id} (shape: {next_token.shape})")
+            
+            return next_token.numpy().astype(np.int64)  # Changed to int64 to match encode
 
         return await self._run_in_model_thread(_sample)
 
@@ -170,6 +202,15 @@ class TransformersShardedInferenceEngine(InferenceEngine):
 
             # Get cache state
             cache_state = self.caches.get(request_id, None)
+            
+            # SPECIAL CASE: If we receive logits (vocab-sized tensor), just return them
+            # This happens because we're running the full model each time, not layer-by-layer
+            if input_tensor.dim() == 3 and input_tensor.shape[-1] > 10000:  # Likely vocab size
+                vocab_size = self.tokenizer.vocab_size if self.tokenizer else input_tensor.shape[-1]
+                if input_tensor.shape[-1] == vocab_size or input_tensor.shape[-1] > 50000:
+                    logger.info(f"Detected logits input (shape {input_tensor.shape}), returning directly")
+                    # Already logits from previous pass, just return them
+                    return input_tensor.cpu().numpy()
 
             # Prepare inputs based on shard position and input shape
             if self.shard.is_first_layer() and input_tensor.dim() <= 2:

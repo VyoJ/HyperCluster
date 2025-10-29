@@ -61,6 +61,7 @@ async def message_handler(message: dict):
     elif msg_type == "llm_message":
         llm_payload = payload
         llm_type = llm_payload.get("llm_type")
+        
         if llm_type == LLMMessageType.RESPONSE.value:
             mode = llm_payload.get('mode', 'unknown')
             rank = llm_payload.get('rank', '?')
@@ -75,6 +76,10 @@ async def message_handler(message: dict):
         # Let the LLM service also handle it if it's a query for us
         if llm_service and llm_service.is_running:
             await llm_service.handle_llm_message(message)
+        elif llm_type == LLMMessageType.QUERY.value:
+            # Log if query received but service not running
+            import logging
+            logging.getLogger("main").warning(f"Received query but LLM service not running (llm_service={llm_service is not None}, running={llm_service.is_running if llm_service else False})")
 
 
 async def run_node(bootstrap_ticket: Optional[str] = None, use_ring: bool = False):
@@ -244,8 +249,25 @@ async def handle_command(args: List[str]):
             table = Table(title="LLM Services")
             table.add_column("Node ID", style="cyan")
             table.add_column("Model Name", style="green")
+            table.add_column("Status", style="yellow")
+            
+            # Add local service if running
+            if llm_service and llm_service.is_running:
+                my_node_id = str(await node.iroh_node.net().node_id())
+                mode = "ring" if llm_service.use_ring else "sharded" if llm_service.use_sharding else "standard"
+                table.add_row(
+                    f"{my_node_id[:16]}... (me)", 
+                    llm_service.model_name,
+                    f"✓ {mode}"
+                )
+            
+            # Add discovered services from other nodes
             for node_id, info in llm_nodes.items():
-                table.add_row(node_id, info.get("model_name", "N/A"))
+                table.add_row(
+                    node_id[:16] + "...", 
+                    info.get("model_name", "N/A"),
+                    info.get("status", "unknown")
+                )
             console.print(table)
 
         elif sub_command == "query":

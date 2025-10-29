@@ -157,19 +157,35 @@ class LLMService:
         payload = message.get("payload", {})
         llm_type = payload.get("llm_type")
 
+        logger.debug(f"handle_llm_message called with type: {llm_type}")
+
         if llm_type == LLMMessageType.QUERY.value:
+            logger.debug(f"Routing to _handle_query")
             await self._handle_query(message.get("sender_id"), payload)
+        else:
+            logger.debug(f"Ignoring llm_type: {llm_type}")
 
     async def _handle_query(self, sender_id: str, data: dict):
         """Process an LLM query from another peer"""
         my_node_id = str(await self.network.iroh_node.net().node_id())
         target_node_id = data.get("target_node_id")
         query_id = data.get("query_id")
+        query = data.get("query")
+
+        logger.info(f"")
+        logger.info(f"📨 RECEIVED QUERY")
+        logger.info(f"   Query ID: {query_id}")
+        logger.info(f"   Query: {query[:50] if query else 'None'}...")
+        logger.info(f"   From: {sender_id[:16]}...")
+        logger.info(f"   Target: {target_node_id[:16] if target_node_id else 'broadcast'}...")
+        logger.info(f"   My ID: {my_node_id[:16]}...")
 
         if target_node_id and target_node_id != my_node_id:
+            logger.info(f"   ↩️  Not for me, skipping")
             return
 
         if not self.is_running or not self.is_loaded:
+            logger.warning(f"   ⚠️  Service not running or not loaded")
             error_response = {
                 "llm_type": LLMMessageType.STATUS.value,
                 "query_id": query_id,
@@ -179,9 +195,11 @@ class LLMService:
             await self._send_llm_data(error_response)
             return
 
-        query = data.get("query")
         if not query:
+            logger.warning(f"   ⚠️  No query content")
             return
+
+        logger.info(f"   ✅ Processing query...")
 
         status_update = {
             "llm_type": LLMMessageType.STATUS.value,
@@ -198,10 +216,13 @@ class LLMService:
 
         # Use ring pipeline, sharded, or single-node inference
         if self.use_ring and self.ring_coordinator:
+            logger.info(f"   🔁 Routing to ring pipeline")
             asyncio.create_task(self._process_query_ring(query_id, query))
         elif self.use_sharding:
+            logger.info(f"   📦 Routing to sharded inference")
             asyncio.create_task(self._process_query_sharded(query_id, query))
         else:
+            logger.info(f"   🔧 Routing to standard inference")
             asyncio.create_task(self._process_query(query_id, query))
 
     async def _process_query(self, query_id: str, query: str):
@@ -337,7 +358,22 @@ class LLMService:
             "payload": query_payload,
             "timestamp": time.time(),
         }
+        
+        # Broadcast to network (for other nodes)
         success = await self.network.broadcast_message(message)
+        
+        # IMPORTANT: In Iroh, nodes don't receive their own broadcasts!
+        # So if this is a local query (no target or target is us), process it directly
+        should_process_locally = (
+            llm_node_id is None or  # No specific target (broadcast to all)
+            llm_node_id == node_id_str  # Target is us
+        )
+        
+        if should_process_locally and self.is_running and self.is_loaded:
+            logger.info(f"💡 Processing query locally (Iroh doesn't deliver own broadcasts)")
+            # Process locally
+            await self._handle_query(node_id_str, query_payload)
+        
         if success:
             return query_id
         return None
