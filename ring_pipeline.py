@@ -101,6 +101,10 @@ class RingPipelineCoordinator:
             my_node_id: This node's ID
             model_total_layers: Total layers in model
         """
+        logger.info(f"🔍 Initializing ring with {len(topology_nodes)} nodes in topology")
+        for i, (nid, cap) in enumerate(topology_nodes):
+            logger.info(f"   Node {i}: {nid[:16]}... - {cap.memory:.1f} GB")
+        
         # Sort nodes to establish consistent ring order
         # Use capabilities (memory) to determine rank
         sorted_nodes = sorted(
@@ -481,6 +485,12 @@ class RingPipelineCoordinator:
             # Forward to next node in ring
             if not self.ring_position:
                 return None
+            
+            # SPECIAL CASE: Single node - don't send to network, just continue processing
+            if self.ring_position.world_size == 1:
+                logger.info(f"   ↻ Single node mode: continuing to next layers locally")
+                # Continue processing remaining layers
+                return await self._process_and_forward(request_id, state, shard)
             
             next_rank = (self.ring_position.rank + 1) % self.ring_position.world_size
             logger.info(f"   📤 Forwarding to Rank {next_rank} ({self.ring_position.next_node_id[:16]}...)")

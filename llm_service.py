@@ -510,10 +510,19 @@ class LLMService:
             network_node=self.network
         )
         
+        # Broadcast topology update to let other nodes know we exist
+        logger.info("Broadcasting topology update to discover peers...")
+        await self.network.broadcast_topology_update()
+        
         # Wait for topology to be populated
+        logger.info("Waiting for peer discovery...")
+        await asyncio.sleep(3.0)  # Give more time for topology updates
+        
         topology_nodes = self.network.topology.all_nodes()
+        logger.info(f"Found {len(topology_nodes)} nodes in topology")
+        
         if not topology_nodes:
-            logger.warning("No topology nodes found, waiting for peers...")
+            logger.warning("No topology nodes found after waiting, trying again...")
             await asyncio.sleep(2.0)
             topology_nodes = self.network.topology.all_nodes()
         
@@ -530,8 +539,15 @@ class LLMService:
                 f"{self.ring_coordinator.layer_window.layer_end}]"
             )
         else:
-            logger.error("Cannot initialize ring: no peers found")
-            self.use_ring = False
+            logger.warning("Cannot initialize ring: no peers found, will run in single-node mode")
+            # Still initialize with just this node
+            my_node_id = str(await self.network.iroh_node.net().node_id())
+            topology_nodes = [(my_node_id, self.network.device_capabilities)]
+            await self.ring_coordinator.initialize_ring(
+                topology_nodes=topology_nodes,
+                my_node_id=my_node_id,
+                model_total_layers=self.current_shard.n_layers
+            )
 
     async def _process_query_ring(self, query_id: str, query: str):
         """Process query using ring pipeline."""

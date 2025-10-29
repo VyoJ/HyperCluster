@@ -43,6 +43,14 @@ async def message_handler(message: dict):
         # Handle ring pipeline tensor messages
         if node and llm_service:
             await node.handle_ring_tensor_message(message, llm_service)
+    elif msg_type == "topology_update":
+        # Handle topology updates from peers
+        if node:
+            peer_capabilities_dict = payload.get("capabilities", {})
+            from device_capabilities import DeviceCapabilities
+            peer_capabilities = DeviceCapabilities.from_dict(peer_capabilities_dict)
+            node.topology.update_node(sender_id, peer_capabilities)
+            console.print(f"[dim]Updated topology: {sender_id[:16]}... - {peer_capabilities.memory:.1f} GB[/dim]")
     elif msg_type == "llm_service_info":
         llm_nodes[sender_id] = payload
         console.print(f"[magenta]LLM service discovered from {sender_id}[/magenta]")
