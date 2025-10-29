@@ -199,6 +199,13 @@ class LLMService:
             logger.warning(f"   ⚠️  No query content")
             return
 
+        # In ring mode, only HEAD node processes queries
+        # Worker nodes only participate by processing ring tensor messages
+        if self.use_ring and self.ring_coordinator and self.ring_coordinator.ring_position:
+            if not self.ring_coordinator.ring_position.is_head:
+                logger.info(f"   ↩️  Worker node (rank {self.ring_coordinator.ring_position.rank}) - skipping query, will participate in ring")
+                return
+
         logger.info(f"   ✅ Processing query...")
 
         status_update = {
