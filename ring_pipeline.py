@@ -424,6 +424,10 @@ class RingPipelineCoordinator:
         # Process layers in my window
         current_data = state.hidden_states
         
+        if current_data is None:
+            logger.error("State has no hidden_states to process!")
+            return None
+        
         layers_to_process = []
         for layer_id in range(
             state.current_layer, 
@@ -517,34 +521,43 @@ class RingPipelineCoordinator:
         This is called when receiving a "tensor_forward" message.
         Based on prima.cpp's llama_recv_tensors().
         """
-        logger.info(f"")
-        logger.info(f"📥 RECEIVED TENSOR")
-        logger.info(f"   From: {sender_id[:16]}...")
-        logger.info(f"   Request: {request_id}")
-        logger.info(f"   Shape: {tensor_data.shape}")
-        logger.info(f"   Is final: {is_final}")
-        
-        # Restore or create state
-        if request_id in self.active_requests:
-            state = self.active_requests[request_id]
-        else:
-            state = InferenceState(
-                request_id=request_id,
-                current_cycle=0,
-                total_cycles=1,
-                current_layer=0,
-                metadata={}
-            )
-            self.active_requests[request_id] = state
-        
-        state.hidden_states = tensor_data
-        
-        if is_final and self.ring_position and self.ring_position.is_head:
-            # Final result received at head
-            return tensor_data
-        
-        # Process and forward
-        await self._process_and_forward(request_id, state, shard)
+        try:
+            logger.info(f"")
+            logger.info(f"📥 RECEIVED TENSOR IN RING COORDINATOR")
+            logger.info(f"   From: {sender_id[:16]}...")
+            logger.info(f"   Request: {request_id}")
+            logger.info(f"   Shape: {tensor_data.shape}")
+            logger.info(f"   Is final: {is_final}")
+            logger.info(f"   My rank: {self.ring_position.rank if self.ring_position else '?'}")
+            
+            # Restore or create state
+            if request_id in self.active_requests:
+                state = self.active_requests[request_id]
+                logger.info(f"   Restored existing state (layer {state.current_layer})")
+            else:
+                state = InferenceState(
+                    request_id=request_id,
+                    current_cycle=0,
+                    total_cycles=1,
+                    current_layer=0,
+                    metadata={}
+                )
+                self.active_requests[request_id] = state
+                logger.info(f"   Created new state")
+            
+            state.hidden_states = tensor_data
+            
+            if is_final and self.ring_position and self.ring_position.is_head:
+                # Final result received at head
+                logger.info(f"   ✅ Final result received at HEAD, returning")
+                return tensor_data
+            
+            # Process and forward
+            logger.info(f"   → Processing and forwarding...")
+            await self._process_and_forward(request_id, state, shard)
+            
+        except Exception as e:
+            logger.error(f"Error in handle_incoming_tensor: {e}", exc_info=True)
     
     async def _send_to_node(
         self,
