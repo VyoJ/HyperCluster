@@ -136,11 +136,36 @@ class RingPipelineCoordinator:
         
         self.layer_window = layer_windows[rank]
         
-        logger.info(
-            f"Ring initialized: rank={rank}/{world_size}, "
-            f"layers=[{self.layer_window.layer_start}:{self.layer_window.layer_end}], "
-            f"prev={prev_node_id[:8]}, next={next_node_id[:8]}"
-        )
+        # Detailed ring topology logging
+        logger.info("=" * 80)
+        logger.info("🔗 RING TOPOLOGY INITIALIZED")
+        logger.info("=" * 80)
+        logger.info(f"📍 My Position:")
+        logger.info(f"   Rank: {rank}/{world_size}")
+        logger.info(f"   Role: {'HEAD (Coordinator)' if rank == 0 else f'WORKER-{rank}'}")
+        logger.info(f"   Node ID: {my_node_id[:16]}...")
+        logger.info(f"")
+        logger.info(f"🔄 Ring Structure:")
+        logger.info(f"   Previous: {prev_node_id[:16]}... (rank {(rank-1)%world_size})")
+        logger.info(f"   Current:  {my_node_id[:16]}... (rank {rank})")
+        logger.info(f"   Next:     {next_node_id[:16]}... (rank {(rank+1)%world_size})")
+        logger.info(f"")
+        logger.info(f"📊 My Layer Assignment:")
+        logger.info(f"   Layers: {self.layer_window.layer_start} → {self.layer_window.layer_end}")
+        logger.info(f"   Count:  {self.layer_window.layer_end - self.layer_window.layer_start + 1} layers")
+        logger.info(f"   Total:  {model_total_layers} layers in model")
+        logger.info(f"")
+        logger.info(f"🌍 Full Cluster Distribution:")
+        for i, window in enumerate(layer_windows):
+            node_short = window.node_id[:16]
+            layer_count = window.layer_end - window.layer_start + 1
+            role = "HEAD" if i == 0 else f"WORK-{i}"
+            marker = "👉 " if i == rank else "   "
+            logger.info(
+                f"{marker}Rank {i} ({role}): Layers {window.layer_start:3d}-{window.layer_end:3d} "
+                f"({layer_count:2d} layers) - {node_short}..."
+            )
+        logger.info("=" * 80)
         
         # Start prefetch worker
         if self.prefetch_task is None:
@@ -162,7 +187,9 @@ class RingPipelineCoordinator:
         Returns:
             List of LayerWindow for each node
         """
+        logger.info("📐 Calculating layer distribution...")
         total_memory = sum(cap.memory for _, cap in sorted_nodes)
+        logger.info(f"   Total cluster memory: {total_memory:.1f} GB")
         
         windows = []
         current_layer = 0
@@ -178,6 +205,11 @@ class RingPipelineCoordinator:
             
             # Ensure at least 1 layer per node
             num_layers = max(1, num_layers)
+            
+            logger.info(
+                f"   Rank {rank}: {capabilities.memory:.1f} GB "
+                f"({memory_fraction*100:.1f}%) → {num_layers} layers"
+            )
             
             window = LayerWindow(
                 node_id=node_id,
@@ -242,16 +274,37 @@ class RingPipelineCoordinator:
         if not self.ring_position or not self.ring_position.is_head:
             raise ValueError("Only head node can start inference")
         
-        logger.info(f"Starting ring inference for request {request_id}")
+        logger.info("=" * 80)
+        logger.info(f"🚀 STARTING RING INFERENCE")
+        logger.info("=" * 80)
+        logger.info(f"Request ID: {request_id}")
+        logger.info(f"Prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}")
+        logger.info(f"Max tokens: {max_tokens}")
+        logger.info(f"Model layers: {shard.n_layers}")
         
         # Encode prompt
+        start_time = time.time()
         tokens = await self.inference_engine.encode(shard, prompt)
         input_tokens = tokens.reshape(1, -1)
+        encode_time = time.time() - start_time
+        
+        logger.info(f"")
+        logger.info(f"📝 Encoding complete:")
+        logger.info(f"   Input tokens: {len(tokens)}")
+        logger.info(f"   Token shape: {input_tokens.shape}")
+        logger.info(f"   Encode time: {encode_time*1000:.1f}ms")
+        logger.info("=" * 80)
         
         generated_tokens = []
         
         # Auto-regressive generation loop
         for step in range(max_tokens):
+            logger.info(f"")
+            logger.info(f"🔄 GENERATION STEP {step + 1}/{max_tokens}")
+            logger.info(f"   Tokens generated so far: {len(generated_tokens)}")
+            
+            step_start = time.time()
+            
             # Process through ring pipeline
             logits = await self._ring_forward_pass(
                 request_id=request_id,
@@ -260,22 +313,35 @@ class RingPipelineCoordinator:
             )
             
             if logits is None:
-                logger.warning("Ring forward pass returned None")
+                logger.warning("⚠️  Ring forward pass returned None, stopping generation")
                 break
             
             # Sample next token
             next_token = await self.inference_engine.sample(logits)
-            generated_tokens.append(int(next_token[0]))
+            token_id = int(next_token[0])
+            generated_tokens.append(token_id)
+            
+            step_time = time.time() - step_start
+            
+            logger.info(f"   ✅ Token {step + 1} sampled: {token_id}")
+            logger.info(f"   ⏱️  Step time: {step_time*1000:.1f}ms")
             
             # Check for EOS
             # TODO: Get proper EOS token from tokenizer
-            if next_token[0] in [2, 0]:  # Common EOS tokens
+            if token_id in [2, 0]:  # Common EOS tokens
+                logger.info(f"   🛑 EOS token detected, stopping generation")
                 break
             
             # Prepare for next iteration
             input_tokens = next_token.reshape(1, 1)
-            
-            logger.debug(f"Step {step}: token={next_token[0]}")
+        
+        total_time = time.time() - start_time
+        logger.info("=" * 80)
+        logger.info(f"✨ GENERATION COMPLETE")
+        logger.info(f"   Total tokens: {len(generated_tokens)}")
+        logger.info(f"   Total time: {total_time:.2f}s")
+        logger.info(f"   Avg token latency: {total_time/max(len(generated_tokens), 1)*1000:.1f}ms/token")
+        logger.info("=" * 80)
         
         return generated_tokens
     
@@ -299,6 +365,12 @@ class RingPipelineCoordinator:
         """
         total_cycles = self.calculate_cycles_needed(shard.n_layers)
         
+        logger.info(f"")
+        logger.info(f"🔁 Ring Forward Pass")
+        logger.info(f"   Input shape: {input_data.shape}")
+        logger.info(f"   Total cycles needed: {total_cycles}")
+        logger.info(f"   Total layers: {shard.n_layers}")
+        
         # Initialize state
         state = InferenceState(
             request_id=request_id,
@@ -312,6 +384,7 @@ class RingPipelineCoordinator:
         self.active_requests[request_id] = state
         
         # Head node starts the ring
+        logger.info(f"   🎯 Initiating ring from HEAD node...")
         result = await self._process_and_forward(request_id, state, shard)
         
         # Wait for completion (result comes back from ring)
@@ -321,8 +394,12 @@ class RingPipelineCoordinator:
         while time.time() - start_time < timeout:
             if state.current_layer >= shard.n_layers:
                 # All layers processed
+                elapsed = time.time() - start_time
+                logger.info(f"   ✅ All layers processed in {elapsed*1000:.1f}ms")
                 break
             await asyncio.sleep(0.1)
+        else:
+            logger.error(f"   ⚠️  Timeout waiting for ring completion!")
         
         # Clean up
         self.active_requests.pop(request_id, None)
@@ -352,9 +429,12 @@ class RingPipelineCoordinator:
                 layers_to_process.append(layer_id)
         
         if layers_to_process:
-            logger.debug(
-                f"Processing layers {layers_to_process[0]}-{layers_to_process[-1]}"
-            )
+            logger.info(f"")
+            logger.info(f"⚙️  Processing on Rank {self.ring_position.rank if self.ring_position else '?'}")
+            logger.info(f"   Layers: {layers_to_process[0]} → {layers_to_process[-1]} ({len(layers_to_process)} layers)")
+            logger.info(f"   Input shape: {current_data.shape}")
+            
+            compute_start = time.time()
             
             # Run inference on assigned layers
             # For now, use the full model inference
@@ -366,19 +446,30 @@ class RingPipelineCoordinator:
                 inference_state=state.metadata
             )
             
+            compute_time = time.time() - compute_start
+            
             current_data = output_data
             state.hidden_states = current_data
             state.current_layer = layers_to_process[-1] + 1
+            
+            logger.info(f"   Output shape: {output_data.shape}")
+            logger.info(f"   ⏱️  Compute time: {compute_time*1000:.1f}ms")
+            logger.info(f"   Next layer: {state.current_layer}/{shard.n_layers}")
+        else:
+            logger.debug(f"   No layers to process in current chunk")
         
         # Check if this is the last layer
         is_final_layer = state.current_layer >= shard.n_layers
         
         if is_final_layer:
+            logger.info(f"   🏁 Final layer reached!")
             # Return logits (head node only)
             if self.ring_position and self.ring_position.is_head:
+                logger.info(f"   ✅ HEAD node: Returning logits for sampling")
                 return current_data
             else:
                 # Send back to head
+                logger.info(f"   📤 Worker node: Sending final result to HEAD")
                 await self._send_to_node(
                     target_node_id=self._find_head_node_id(),
                     data=current_data,
@@ -390,6 +481,10 @@ class RingPipelineCoordinator:
             # Forward to next node in ring
             if not self.ring_position:
                 return None
+            
+            next_rank = (self.ring_position.rank + 1) % self.ring_position.world_size
+            logger.info(f"   📤 Forwarding to Rank {next_rank} ({self.ring_position.next_node_id[:16]}...)")
+            
             await self._send_to_node(
                 target_node_id=self.ring_position.next_node_id,
                 data=current_data,
@@ -412,9 +507,12 @@ class RingPipelineCoordinator:
         This is called when receiving a "tensor_forward" message.
         Based on prima.cpp's llama_recv_tensors().
         """
-        logger.debug(
-            f"Received tensor from {sender_id[:8]} for request {request_id}"
-        )
+        logger.info(f"")
+        logger.info(f"📥 RECEIVED TENSOR")
+        logger.info(f"   From: {sender_id[:16]}...")
+        logger.info(f"   Request: {request_id}")
+        logger.info(f"   Shape: {tensor_data.shape}")
+        logger.info(f"   Is final: {is_final}")
         
         # Restore or create state
         if request_id in self.active_requests:
@@ -461,6 +559,11 @@ class RingPipelineCoordinator:
         tensor_bytes = data.tobytes()
         tensor_b64 = base64.b64encode(tensor_bytes).decode("utf-8")
         
+        size_mb = len(tensor_bytes) / 1024 / 1024
+        logger.info(f"   📤 Sending tensor: {size_mb:.2f} MB")
+        
+        send_start = time.time()
+        
         message = {
             "type": "ring_tensor_forward",
             "sender_id": str(await self.network.iroh_node.net().node_id()),
@@ -476,6 +579,9 @@ class RingPipelineCoordinator:
         }
         
         await self.network.send_message(doc_id, message)
+        
+        send_time = time.time() - send_start
+        logger.info(f"   ✅ Sent in {send_time*1000:.1f}ms")
     
     def _find_head_node_id(self) -> str:
         """Find the head node (rank 0) ID."""
