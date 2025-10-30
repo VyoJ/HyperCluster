@@ -48,6 +48,9 @@ class Node:
             str, Tuple[List[int], bool]
         ] = {}  # request_id -> (tokens, is_finished)
         self.inference_states: Dict[str, Dict] = {}  # request_id -> inference_state
+        
+        # Cache for binary tensor data (size -> hash)
+        self.tensor_cache: Dict[int, str] = {}  # size -> content_hash
 
     async def start(self):
         """Start the Iroh node."""
@@ -186,8 +189,9 @@ class Node:
                 message_data = json.loads(content.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 # This is binary data (e.g., tensor), not a JSON message
-                # These are fetched explicitly by key, so we can skip them here
-                logger.debug(f"📦 Skipping binary content (not JSON message): {content_size} bytes")
+                # Cache it so we can fetch it later by size
+                logger.debug(f"📦 Caching binary content: {content_size} bytes, hash={hash_str[:16]}...")
+                self.tensor_cache[content_size] = hash_str
                 return
             
             # DIAGNOSTIC: Log received content with size
@@ -509,52 +513,39 @@ class Node:
             logger.info(f"   Tensor shape: {tensor_shape}, dtype: {tensor_dtype}, size: {tensor_size/1024/1024:.2f}MB")
             logger.info(f"   Is final: {is_final}")
             
-            # Fetch tensor from document by key
-            # The sender stored it as a document entry, so it should sync automatically
+            # Fetch tensor from cache
+            # We cached the tensor hash when we saw it arrive as binary content
             fetch_start = time.time()
-            logger.info(f"   📥 Fetching tensor from document...")
+            logger.info(f"   📥 Fetching tensor from cache...")
             
-            # Get the document
-            doc_id = next(iter(self.documents))
-            doc = self.documents[doc_id]
-            
-            # Wait a bit for sync if needed
+            # Wait for tensor to arrive and be cached
             max_wait = 5.0  # seconds
             wait_start = time.time()
             tensor_bytes = None
             
             while time.time() - wait_start < max_wait:
-                try:
-                    # Query for entries with this key (from any author)
-                    import iroh
-                    tensor_key_bytes = tensor_key_str.encode("utf-8")
+                # Check if we have a cached hash for this tensor size
+                if tensor_size in self.tensor_cache:
+                    content_hash_str = self.tensor_cache[tensor_size]
+                    logger.info(f"   ✅ Found cached tensor: hash={content_hash_str[:16]}...")
                     
-                    # Get all entries and find the one with our key
-                    entries = await doc.get_many(iroh.Query.all())
+                    # Read it from blobs
+                    from iroh import Hash
+                    content_hash = Hash.from_string(content_hash_str)
+                    tensor_bytes = await self.iroh_node.blobs().read_to_bytes(content_hash)
+                    logger.info(f"   ✅ Tensor fetched: {len(tensor_bytes)} bytes")
                     
-                    found_entry = None
-                    for entry in entries:
-                        if entry.key() == tensor_key_bytes:
-                            found_entry = entry
-                            logger.debug(f"   ✅ Found entry with key {tensor_key_str[:32]}...")
-                            break
-                    
-                    if found_entry:
-                        # Found it! Read the tensor bytes
-                        content_hash = found_entry.content_hash()
-                        tensor_bytes = await self.iroh_node.blobs().read_to_bytes(content_hash)
-                        logger.info(f"   ✅ Tensor fetched from document: {len(tensor_bytes)} bytes")
-                        break
-                    else:
-                        # Not synced yet, wait a bit
-                        logger.debug(f"   ⏳ Entry not found yet, waiting... (elapsed: {time.time()-wait_start:.1f}s)")
-                        await asyncio.sleep(0.2)
-                except Exception as e:
-                    logger.debug(f"   ⏳ Waiting for tensor to sync... ({e})")
+                    # Clean up cache
+                    del self.tensor_cache[tensor_size]
+                    break
+                else:
+                    # Not cached yet, wait a bit
+                    logger.debug(f"   ⏳ Waiting for tensor to arrive... (elapsed: {time.time()-wait_start:.1f}s)")
                     await asyncio.sleep(0.2)
             
             if tensor_bytes is None:
-                logger.error(f"   ❌ Timeout waiting for tensor to sync from document")
+                logger.error(f"   ❌ Timeout waiting for tensor to arrive")
+                logger.error(f"   Cache contents: {list(self.tensor_cache.keys())}")
                 return
             
             fetch_time = time.time() - fetch_start
