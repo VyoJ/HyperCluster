@@ -102,12 +102,16 @@ class Node:
             return None
         try:
             doc = await self.iroh_node.docs().create()
+            
+            # Use RELAY_AND_ADDRESSES to ensure connectivity
             ticket = await doc.share(
                 ShareMode.WRITE, AddrInfoOptions.RELAY_AND_ADDRESSES
             )
             doc_id = str(doc.id())
             self.documents[doc_id] = doc
-            logger.info(f"Created document with ID: {doc_id}")
+            logger.info(f"Created document with ID: {doc_id[:16]}...")
+            logger.info(f"Document sharing mode: WRITE with RELAY_AND_ADDRESSES")
+            
             await self.subscribe_to_doc_events(doc)
             return str(ticket), doc_id
         except Exception as e:
@@ -124,9 +128,14 @@ class Node:
             doc = await self.iroh_node.docs().join(ticket)
             doc_id = str(doc.id())
             self.documents[doc_id] = doc
-            logger.info(f"Joined document with ID: {doc_id}")
+            logger.info(f"Joined document with ID: {doc_id[:16]}...")
+            
+            # Give Iroh time to establish sync with peers
+            logger.info(f"⏳ Waiting 2s for document sync to stabilize...")
+            await asyncio.sleep(2.0)
 
             await self.subscribe_to_doc_events(doc)
+            logger.info(f"✅ Document joined and ready")
             return doc_id
         except Exception as e:
             logger.error(f"Failed to join document: {e}")
@@ -220,10 +229,9 @@ class Node:
             
             logger.debug(f"✅ Successfully wrote message to document")
             
-            # For large messages, add a small delay to allow sync
-            if payload_size > 100000:
-                logger.info(f"⏳ Waiting 1s for large message to sync...")
-                await asyncio.sleep(1.0)
+            # Small delay for document sync (no longer needed for large payloads since we use blobs)
+            if payload_size > 10000:  # Only for moderately large metadata
+                await asyncio.sleep(0.1)
             
             return True
         except Exception as e:
@@ -440,14 +448,13 @@ class Node:
         """
         Handle incoming ring tensor forward message.
         
-        This processes tensors forwarded from the previous node in the ring
-        and passes them to the ring coordinator for processing.
+        This fetches the tensor blob and passes it to the ring coordinator.
+        Uses Iroh blobs for efficient large data transfer.
         """
         try:
             sender_id = message_data.get("sender_id")
             target_node_id = message_data.get("target_node_id")
             payload = message_data.get("payload", {})
-            # FIX: request_id is at root level, not in payload
             request_id = message_data.get("request_id", "unknown")
             
             # Check if this message is for us
@@ -466,7 +473,6 @@ class Node:
             logger.info(f"📨 RECEIVED RING TENSOR MESSAGE")
             logger.info(f"   From: {sender_id[:16] if sender_id else 'unknown'}...")
             logger.info(f"   Request ID: {request_id}")
-            logger.info(f"   Target: {'me' if target_node_id == my_node_id else 'broadcast'}")
             
             # Check if LLM service and ring coordinator are available
             if not llm_service:
@@ -481,23 +487,35 @@ class Node:
                 logger.warning("   ⚠️  LLM service not running")
                 return
             
-            # Deserialize tensor
-            import base64
-            tensor_b64 = payload.get("tensor_data", "")
-            if not tensor_b64:
-                logger.error("   ❌ No tensor data in message")
+            # Get blob hash and metadata
+            blob_hash_str = payload.get("blob_hash", "")
+            if not blob_hash_str:
+                logger.error("   ❌ No blob hash in message")
                 return
-                
-            tensor_bytes = base64.b64decode(tensor_b64)
+            
             tensor_shape = tuple(payload.get("tensor_shape", []))
             tensor_dtype = np.dtype(payload.get("tensor_dtype", "float32"))
+            tensor_size = payload.get("tensor_size", 0)
             is_final = payload.get("is_final", False)
             
-            logger.info(f"   Tensor shape: {tensor_shape}, dtype: {tensor_dtype}")
+            logger.info(f"   Blob hash: {blob_hash_str[:16]}...")
+            logger.info(f"   Tensor shape: {tensor_shape}, dtype: {tensor_dtype}, size: {tensor_size/1024/1024:.2f}MB")
             logger.info(f"   Is final: {is_final}")
+            
+            # Fetch tensor blob from Iroh
+            from iroh import Hash
+            blob_hash = Hash.from_string(blob_hash_str)
+            
+            blob_start = time.time()
+            logger.info(f"   📥 Fetching tensor blob...")
+            tensor_bytes = await self.iroh_node.blobs().read_to_bytes(blob_hash)
+            blob_time = time.time() - blob_start
+            
+            logger.info(f"   ✅ Blob fetched: {len(tensor_bytes)} bytes in {blob_time*1000:.1f}ms")
             
             # Reconstruct tensor
             tensor = np.frombuffer(tensor_bytes, dtype=tensor_dtype).reshape(tensor_shape)
+            logger.info(f"   ✅ Tensor reconstructed: shape={tensor.shape}")
             
             # Pass to ring coordinator
             logger.info(f"   ✅ Passing to ring coordinator...")

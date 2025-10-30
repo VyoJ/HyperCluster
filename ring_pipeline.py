@@ -609,8 +609,11 @@ class RingPipelineCoordinator:
         self, target_node_id: str, data: np.ndarray, request_id: str, is_final: bool
     ):
         """
-        Send tensor to another node via Iroh.
+        Send tensor to another node via Iroh blobs.
         Based on prima.cpp's llama_send_tensors().
+        
+        Uses Iroh's blob storage for large binary data (tensor),
+        and sends only the blob hash through the document.
         """
         # Get document ID for communication
         if not self.network.documents:
@@ -619,29 +622,34 @@ class RingPipelineCoordinator:
 
         doc_id = next(iter(self.network.documents))
 
-        # Serialize and send
-        import base64
-
+        send_start = time.time()
+        
+        # Serialize tensor to bytes
         tensor_bytes = data.tobytes()
-        tensor_b64 = base64.b64encode(tensor_bytes).decode("utf-8")
-
         size_mb = len(tensor_bytes) / 1024 / 1024
         logger.info(f"   📤 Sending tensor: {size_mb:.2f} MB")
         logger.info(f"   📤 Target: {target_node_id[:16]}...")
         logger.info(f"   📤 Request ID: {request_id}")
-        logger.info(f"   📤 Doc ID: {doc_id[:16]}...")
 
-        send_start = time.time()
+        # Step 1: Add tensor as Iroh blob (this handles large data efficiently)
+        blob_start = time.time()
+        add_outcome = await self.network.iroh_node.blobs().add_bytes(tensor_bytes)
+        blob_hash = add_outcome.hash
+        blob_time = time.time() - blob_start
+        
+        logger.info(f"   ✅ Tensor stored as blob: {str(blob_hash)[:16]}... in {blob_time*1000:.1f}ms")
 
+        # Step 2: Send small metadata message with blob hash through document
         message = {
             "type": "ring_tensor_forward",
             "sender_id": str(await self.network.iroh_node.net().node_id()),
             "target_node_id": target_node_id,
             "request_id": request_id,
             "payload": {
-                "tensor_data": tensor_b64,
+                "blob_hash": str(blob_hash),  # Just the hash, not the data!
                 "tensor_shape": list(data.shape),
                 "tensor_dtype": str(data.dtype),
+                "tensor_size": len(tensor_bytes),
                 "is_final": is_final,
             },
             "timestamp": time.time(),
@@ -651,7 +659,7 @@ class RingPipelineCoordinator:
         
         send_time = time.time() - send_start
         if success:
-            logger.info(f"   ✅ Sent in {send_time*1000:.1f}ms")
+            logger.info(f"   ✅ Metadata sent in {send_time*1000:.1f}ms (total)")
         else:
             logger.error(f"   ❌ Failed to send message!")
         
