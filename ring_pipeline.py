@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class RingPosition:
     """Represents a node's position in the ring."""
-    
+
     rank: int  # 0 = head node (coordinator)
     world_size: int  # Total number of nodes
     prev_node_id: str  # Node to receive from
@@ -36,21 +36,21 @@ class RingPosition:
 @dataclass
 class LayerWindow:
     """Represents a window of layers assigned to a node."""
-    
+
     node_id: str
     rank: int
     layer_start: int  # First layer in window
-    layer_end: int    # Last layer in window (inclusive)
+    layer_end: int  # Last layer in window (inclusive)
     total_layers: int
 
 
 @dataclass
 class InferenceState:
     """Maintains state during ring pipeline inference."""
-    
+
     request_id: str
     current_cycle: int  # Which round through the ring (0-indexed)
-    total_cycles: int   # Total rounds needed
+    total_cycles: int  # Total rounds needed
     current_layer: int  # Next layer to process
     hidden_states: Optional[np.ndarray] = None
     kv_cache: Optional[Dict] = None
@@ -60,17 +60,17 @@ class InferenceState:
 class RingPipelineCoordinator:
     """
     Coordinates ring pipeline inference across nodes.
-    
+
     Based on prima.cpp's ring communication pattern:
     - Rank 0 (head) initiates requests and collects final output
     - Data flows: Rank 0 → 1 → 2 → ... → N-1 → 0 (ring)
     - Multiple cycles needed when layers > sum(layer_windows)
     """
-    
+
     def __init__(self, inference_engine, network_node):
         """
         Initialize ring coordinator.
-        
+
         Args:
             inference_engine: The inference engine (TransformersShardedInferenceEngine)
             network_node: The network node (Node instance)
@@ -79,87 +79,91 @@ class RingPipelineCoordinator:
         self.network = network_node
         self.ring_position: Optional[RingPosition] = None
         self.layer_window: Optional[LayerWindow] = None
-        
+
         # Track active inference requests
         self.active_requests: Dict[str, InferenceState] = OrderedDict()
-        
+
         # Prefetch queue
         self.prefetch_queue = asyncio.Queue()
         self.prefetch_task: Optional[asyncio.Task] = None
-    
+
     async def initialize_ring(
-        self, 
-        topology_nodes: List[Tuple[str, any]], 
+        self,
+        topology_nodes: List[Tuple[str, any]],
         my_node_id: str,
-        model_total_layers: int
+        model_total_layers: int,
     ):
         """
         Initialize ring topology and layer assignment.
-        
+
         Args:
             topology_nodes: List of (node_id, capabilities) tuples
             my_node_id: This node's ID
             model_total_layers: Total layers in model
         """
-        logger.info(f"🔍 Initializing ring with {len(topology_nodes)} nodes in topology")
+        logger.info(
+            f"🔍 Initializing ring with {len(topology_nodes)} nodes in topology"
+        )
         for i, (nid, cap) in enumerate(topology_nodes):
             logger.info(f"   Node {i}: {nid[:16]}... - {cap.memory:.1f} GB")
-        
+
         # Sort nodes to establish consistent ring order
         # Use capabilities (memory) to determine rank
         sorted_nodes = sorted(
-            topology_nodes, 
-            key=lambda x: (x[1].memory, x[0]), 
-            reverse=True
+            topology_nodes, key=lambda x: (x[1].memory, x[0]), reverse=True
         )
-        
+
         # Find my rank
         rank = next(i for i, (nid, _) in enumerate(sorted_nodes) if nid == my_node_id)
         world_size = len(sorted_nodes)
-        
+
         # Determine ring neighbors
         prev_rank = (rank - 1) % world_size
         next_rank = (rank + 1) % world_size
-        
+
         prev_node_id = sorted_nodes[prev_rank][0]
         next_node_id = sorted_nodes[next_rank][0]
-        
+
         self.ring_position = RingPosition(
             rank=rank,
             world_size=world_size,
             prev_node_id=prev_node_id,
             next_node_id=next_node_id,
             is_head=(rank == 0),
-            is_tail=(rank == world_size - 1)
+            is_tail=(rank == world_size - 1),
         )
-        
+
         # Calculate layer windows (memory-weighted)
-        layer_windows = self._calculate_layer_windows(
-            sorted_nodes, model_total_layers
-        )
-        
+        layer_windows = self._calculate_layer_windows(sorted_nodes, model_total_layers)
+
         self.layer_window = layer_windows[rank]
-        
+
         # Detailed ring topology logging
         logger.info("=" * 80)
         logger.info("🔗 RING TOPOLOGY INITIALIZED")
         logger.info("=" * 80)
-        logger.info(f"📍 My Position:")
+        logger.info("📍 My Position:")
         logger.info(f"   Rank: {rank}/{world_size}")
-        logger.info(f"   Role: {'HEAD (Coordinator)' if rank == 0 else f'WORKER-{rank}'}")
+        logger.info(
+            f"   Role: {'HEAD (Coordinator)' if rank == 0 else f'WORKER-{rank}'}"
+        )
         logger.info(f"   Node ID: {my_node_id[:16]}...")
-        logger.info(f"")
-        logger.info(f"🔄 Ring Structure:")
+        logger.info("")
+        logger.info("🔄 Ring Structure:")
         logger.info(f"   Previous: {prev_node_id[:16]}... (rank {(rank-1)%world_size})")
         logger.info(f"   Current:  {my_node_id[:16]}... (rank {rank})")
         logger.info(f"   Next:     {next_node_id[:16]}... (rank {(rank+1)%world_size})")
-        logger.info(f"")
-        logger.info(f"📊 My Layer Assignment:")
-        logger.info(f"   Layers: {self.layer_window.layer_start} → {self.layer_window.layer_end}")
-        logger.info(f"   Count:  {self.layer_window.layer_end - self.layer_window.layer_start + 1} layers")
+        logger.info("")
+        logger.info("📊 My Layer Assignment:")
+        logger.info(
+            f"   Layers: {self.layer_window.layer_start} → {self.layer_window.layer_end}"
+        )
+        logger.info(
+            f"   Count:  {self.layer_window.layer_end - self.layer_window.layer_start + 1} layers"
+        )
         logger.info(f"   Total:  {model_total_layers} layers in model")
-        logger.info(f"")
-        logger.info(f"🌍 Full Cluster Distribution:")
+        logger.info("")
+        logger.info("🌍 Full Cluster Distribution:")
         for i, window in enumerate(layer_windows):
             node_short = window.node_id[:16]
             layer_count = window.layer_end - window.layer_start + 1
@@ -170,63 +174,61 @@ class RingPipelineCoordinator:
                 f"({layer_count:2d} layers) - {node_short}..."
             )
         logger.info("=" * 80)
-        
+
         # Start prefetch worker
         if self.prefetch_task is None:
             self.prefetch_task = asyncio.create_task(self._prefetch_worker())
-    
+
     def _calculate_layer_windows(
-        self, 
-        sorted_nodes: List[Tuple[str, any]], 
-        total_layers: int
+        self, sorted_nodes: List[Tuple[str, any]], total_layers: int
     ) -> List[LayerWindow]:
         """
         Calculate layer windows for each node based on memory.
         Similar to prima.cpp's assign_layers_to_device().
-        
+
         Args:
             sorted_nodes: Nodes sorted by memory (descending)
             total_layers: Total model layers
-            
+
         Returns:
             List of LayerWindow for each node
         """
         logger.info("📐 Calculating layer distribution...")
         total_memory = sum(cap.memory for _, cap in sorted_nodes)
         logger.info(f"   Total cluster memory: {total_memory:.1f} GB")
-        
+
         windows = []
         current_layer = 0
-        
+
         for rank, (node_id, capabilities) in enumerate(sorted_nodes):
             # Proportional allocation
             memory_fraction = capabilities.memory / total_memory
             num_layers = int(total_layers * memory_fraction)
-            
+
             # Ensure last node gets remaining layers
             if rank == len(sorted_nodes) - 1:
                 num_layers = total_layers - current_layer
-            
+
             # Ensure at least 1 layer per node
             num_layers = max(1, num_layers)
-            
+
             logger.info(
                 f"   Rank {rank}: {capabilities.memory:.1f} GB "
                 f"({memory_fraction*100:.1f}%) → {num_layers} layers"
             )
-            
+
             window = LayerWindow(
                 node_id=node_id,
                 rank=rank,
                 layer_start=current_layer,
                 layer_end=current_layer + num_layers - 1,
-                total_layers=total_layers
+                total_layers=total_layers,
             )
             windows.append(window)
             current_layer += num_layers
-        
+
         return windows
-    
+
     def this_layer_is_mine(self, layer_id: int) -> bool:
         """
         Check if a layer belongs to this node.
@@ -234,169 +236,172 @@ class RingPipelineCoordinator:
         """
         if not self.layer_window:
             return False
-        
-        return (
-            self.layer_window.layer_start <= layer_id <= self.layer_window.layer_end
-        )
-    
+
+        return self.layer_window.layer_start <= layer_id <= self.layer_window.layer_end
+
     def calculate_cycles_needed(self, total_layers: int) -> int:
         """
         Calculate how many cycles through the ring are needed.
-        
+
         In prima.cpp, this happens when model has more layers than
         can be handled in a single pass through all devices.
         """
         if not self.layer_window:
             return 1
-        
+
         # Sum of all layer windows
         total_window = self.layer_window.layer_end + 1
-        
+
         # Cycles = ceil(total_layers / total_window)
         cycles = (total_layers + total_window - 1) // total_window
         return cycles
-    
+
     async def start_inference(
-        self, 
-        request_id: str, 
-        prompt: str, 
-        shard: Shard,
-        max_tokens: int = 256
+        self, request_id: str, prompt: str, shard: Shard, max_tokens: int = 256
     ) -> List[int]:
         """
         Start ring pipeline inference (head node only).
-        
+
         Args:
             request_id: Unique request ID
             prompt: Input prompt
-            shard: Full model shard info
+            shard: Base shard representing full model (used for model_id and n_layers)
             max_tokens: Max tokens to generate
-            
+
         Returns:
             List of generated token IDs
         """
         if not self.ring_position or not self.ring_position.is_head:
             raise ValueError("Only head node can start inference")
-        
+
         logger.info("=" * 80)
-        logger.info(f"🚀 STARTING RING INFERENCE")
+        logger.info("🚀 STARTING RING INFERENCE")
         logger.info("=" * 80)
         logger.info(f"Request ID: {request_id}")
         logger.info(f"Prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}")
         logger.info(f"Max tokens: {max_tokens}")
         logger.info(f"Model layers: {shard.n_layers}")
-        
+
         # Encode prompt
         start_time = time.time()
         tokens = await self.inference_engine.encode(shard, prompt)
         input_tokens = tokens.reshape(1, -1)
         encode_time = time.time() - start_time
-        
-        logger.info(f"")
-        logger.info(f"📝 Encoding complete:")
+
+        logger.info("")
+        logger.info("📝 Encoding complete:")
         logger.info(f"   Input tokens: {len(tokens)}")
         logger.info(f"   Token shape: {input_tokens.shape}")
         logger.info(f"   Encode time: {encode_time*1000:.1f}ms")
         logger.info("=" * 80)
-        
+
         generated_tokens = []
-        
+
         # Auto-regressive generation loop
         for step in range(max_tokens):
-            logger.info(f"")
+            logger.info("")
             logger.info(f"🔄 GENERATION STEP {step + 1}/{max_tokens}")
             logger.info(f"   Tokens generated so far: {len(generated_tokens)}")
-            
+
             step_start = time.time()
-            
+
             # Process through ring pipeline
             logits = await self._ring_forward_pass(
-                request_id=request_id,
-                input_data=input_tokens,
-                shard=shard
+                request_id=request_id, input_data=input_tokens, shard=shard
             )
-            
+
             if logits is None:
-                logger.warning("⚠️  Ring forward pass returned None, stopping generation")
+                logger.warning(
+                    "⚠️  Ring forward pass returned None, stopping generation"
+                )
                 break
-            
+
             # Sample next token
-            next_token = await self.inference_engine.sample(logits)
+            next_token = await self.inference_engine.sample(
+                logits, temp=0.7
+            )  # Use temperature sampling for better diversity
             token_id = int(next_token[0])
             generated_tokens.append(token_id)
-            
+
             step_time = time.time() - step_start
-            
+
             logger.info(f"   ✅ Token {step + 1} sampled: {token_id}")
             logger.info(f"   ⏱️  Step time: {step_time*1000:.1f}ms")
-            
+
             # Show decoded text every 10 tokens
             if (step + 1) % 10 == 0 or step == 0:
                 try:
-                    decoded_so_far = await self.inference_engine.decode(shard, np.array(generated_tokens))
-                    logger.info(f"   📝 Text so far: {decoded_so_far[:100]}{'...' if len(decoded_so_far) > 100 else ''}")
+                    decoded_so_far = await self.inference_engine.decode(
+                        shard, np.array(generated_tokens)
+                    )
+                    logger.info(
+                        f"   📝 Text so far: {decoded_so_far[:100]}{'...' if len(decoded_so_far) > 100 else ''}"
+                    )
                 except Exception as e:
                     logger.debug(f"Could not decode partial output: {e}")
-            
+
             # Check for EOS
             eos_token_id = self.inference_engine.tokenizer.eos_token_id
             if token_id == eos_token_id:
-                logger.info(f"   🛑 EOS token ({eos_token_id}) detected, stopping generation")
+                logger.info(
+                    f"   🛑 EOS token ({eos_token_id}) detected, stopping generation"
+                )
                 break
-            
+
             # Prepare for next iteration
             input_tokens = next_token.reshape(1, 1)
-        
+
         total_time = time.time() - start_time
-        
+
         # Decode the generated tokens to text
         try:
-            decoded_text = await self.inference_engine.decode(shard, np.array(generated_tokens))
+            decoded_text = await self.inference_engine.decode(
+                shard, np.array(generated_tokens)
+            )
         except Exception as e:
             logger.error(f"Error decoding tokens: {e}")
             decoded_text = f"[Error decoding: {e}]"
-        
+
         logger.info("=" * 80)
-        logger.info(f"✨ GENERATION COMPLETE")
+        logger.info("✨ GENERATION COMPLETE")
         logger.info(f"   Total tokens: {len(generated_tokens)}")
         logger.info(f"   Total time: {total_time:.2f}s")
-        logger.info(f"   Avg token latency: {total_time/max(len(generated_tokens), 1)*1000:.1f}ms/token")
+        logger.info(
+            f"   Avg token latency: {total_time/max(len(generated_tokens), 1)*1000:.1f}ms/token"
+        )
         logger.info("=" * 80)
-        logger.info(f"")
-        logger.info(f"📄 GENERATED TEXT:")
+        logger.info("")
+        logger.info("📄 GENERATED TEXT:")
         logger.info(f"{'─' * 80}")
         logger.info(f"{decoded_text}")
         logger.info(f"{'─' * 80}")
-        logger.info(f"")
-        
+        logger.info("")
+
         return generated_tokens
-    
+
     async def _ring_forward_pass(
-        self,
-        request_id: str,
-        input_data: np.ndarray,
-        shard: Shard
+        self, request_id: str, input_data: np.ndarray, shard: Shard
     ) -> Optional[np.ndarray]:
         """
         Execute one forward pass through the ring.
-        
+
         This implements prima.cpp's llama_decode_internal() ring logic:
         1. Process local layers
         2. Send to next node
         3. Receive from previous node (if not first cycle)
         4. Repeat until all layers processed
-        
+
         Returns:
             Final logits (head node only)
         """
         total_cycles = self.calculate_cycles_needed(shard.n_layers)
-        
-        logger.info(f"")
-        logger.info(f"🔁 Ring Forward Pass")
+
+        logger.info("")
+        logger.info("🔁 Ring Forward Pass")
         logger.info(f"   Input shape: {input_data.shape}")
         logger.info(f"   Total cycles needed: {total_cycles}")
         logger.info(f"   Total layers: {shard.n_layers}")
-        
+
         # Initialize state
         state = InferenceState(
             request_id=request_id,
@@ -404,19 +409,19 @@ class RingPipelineCoordinator:
             total_cycles=total_cycles,
             current_layer=0,
             hidden_states=input_data,
-            metadata={"step": 0}
+            metadata={"step": 0},
         )
-        
+
         self.active_requests[request_id] = state
-        
+
         # Head node starts the ring
-        logger.info(f"   🎯 Initiating ring from HEAD node...")
+        logger.info("   🎯 Initiating ring from HEAD node...")
         result = await self._process_and_forward(request_id, state, shard)
-        
+
         # Wait for completion (result comes back from ring)
         timeout = 30.0  # seconds
         start_time = time.time()
-        
+
         while time.time() - start_time < timeout:
             if state.current_layer >= shard.n_layers:
                 # All layers processed
@@ -425,133 +430,151 @@ class RingPipelineCoordinator:
                 break
             await asyncio.sleep(0.1)
         else:
-            logger.error(f"   ⚠️  Timeout waiting for ring completion!")
-        
+            logger.error("   ⚠️  Timeout waiting for ring completion!")
+
         # Clean up
         self.active_requests.pop(request_id, None)
-        
+
         return result
-    
+
     async def _process_and_forward(
-        self,
-        request_id: str,
-        state: InferenceState,
-        shard: Shard
+        self, request_id: str, state: InferenceState, shard: Shard
     ) -> Optional[np.ndarray]:
         """
         Process assigned layers and forward to next node.
-        
+
         Based on prima.cpp's layer processing loop in llama_decode_internal.
         """
         # Process layers in my window
         current_data = state.hidden_states
-        
+
         if current_data is None:
             logger.error("State has no hidden_states to process!")
             return None
-        
+
         layers_to_process = []
-        for layer_id in range(
-            state.current_layer, 
-            min(state.current_layer + 10, shard.n_layers)  # Process in chunks
-        ):
-            if self.this_layer_is_mine(layer_id):
-                layers_to_process.append(layer_id)
-        
+
+        # In single-node mode, process ALL remaining layers at once
+        # to avoid intermediate LM head application
+        if self.ring_position and self.ring_position.world_size == 1:
+            # Process all remaining layers
+            for layer_id in range(state.current_layer, shard.n_layers):
+                if self.this_layer_is_mine(layer_id):
+                    layers_to_process.append(layer_id)
+        else:
+            # Multi-node: process in chunks for better pipelining
+            for layer_id in range(
+                state.current_layer,
+                min(state.current_layer + 10, shard.n_layers),  # Process in chunks
+            ):
+                if self.this_layer_is_mine(layer_id):
+                    layers_to_process.append(layer_id)
+
         if layers_to_process:
-            logger.info(f"")
-            logger.info(f"⚙️  Processing on Rank {self.ring_position.rank if self.ring_position else '?'}")
-            logger.info(f"   Layers: {layers_to_process[0]} → {layers_to_process[-1]} ({len(layers_to_process)} layers)")
+            logger.info("")
+            logger.info(
+                f"⚙️  Processing on Rank {self.ring_position.rank if self.ring_position else '?'}"
+            )
+            logger.info(
+                f"   Layers: {layers_to_process[0]} → {layers_to_process[-1]} ({len(layers_to_process)} layers)"
+            )
             logger.info(f"   Input shape: {current_data.shape}")
-            
+
             compute_start = time.time()
-            
-            # Run inference on assigned layers
-            # For now, use the full model inference
-            # TODO: Implement true layer-by-layer processing
+
+            # NOTE: Do NOT create a new shard here!
+            # The inference engine already has the correct shard loaded for this node
+            # from initialization. We just pass the base shard spec for reference.
+            # The actual layer filtering happens in the loaded model.
+
+            # Run inference on assigned layers using the already-loaded sharded model
             output_data, new_state = await self.inference_engine.infer_tensor(
                 request_id=request_id,
-                shard=shard,
+                shard=shard,  # Use base shard, inference engine has correct shard loaded
                 input_data=current_data,
-                inference_state=state.metadata
+                inference_state=state.metadata,
             )
-            
+
             compute_time = time.time() - compute_start
-            
+
             current_data = output_data
             state.hidden_states = current_data
             state.current_layer = layers_to_process[-1] + 1
-            
+
             logger.info(f"   Output shape: {output_data.shape}")
             logger.info(f"   ⏱️  Compute time: {compute_time*1000:.1f}ms")
             logger.info(f"   Next layer: {state.current_layer}/{shard.n_layers}")
         else:
-            logger.debug(f"   No layers to process in current chunk")
-        
+            logger.debug("   No layers to process in current chunk")
+
         # Check if this is the last layer
         is_final_layer = state.current_layer >= shard.n_layers
-        
+
         if is_final_layer:
-            logger.info(f"   🏁 Final layer reached!")
+            logger.info("   🏁 Final layer reached!")
             # Return logits (head node only)
             if self.ring_position and self.ring_position.is_head:
-                logger.info(f"   ✅ HEAD node: Returning logits for sampling")
+                logger.info("   ✅ HEAD node: Returning logits for sampling")
                 return current_data
             else:
                 # Send back to head
-                logger.info(f"   📤 Worker node: Sending final result to HEAD")
+                logger.info("   📤 Worker node: Sending final result to HEAD")
                 await self._send_to_node(
                     target_node_id=self._find_head_node_id(),
                     data=current_data,
                     request_id=request_id,
-                    is_final=True
+                    is_final=True,
                 )
                 return None
         else:
             # Forward to next node in ring
             if not self.ring_position:
                 return None
-            
+
             # SPECIAL CASE: Single node - don't send to network, just continue processing
             if self.ring_position.world_size == 1:
-                logger.info(f"   ↻ Single node mode: continuing to next layers locally")
+                logger.info("   ↻ Single node mode: continuing to next layers locally")
                 # Continue processing remaining layers
                 return await self._process_and_forward(request_id, state, shard)
-            
+
             next_rank = (self.ring_position.rank + 1) % self.ring_position.world_size
-            logger.info(f"   📤 Forwarding to Rank {next_rank} ({self.ring_position.next_node_id[:16]}...)")
-            
+            logger.info(
+                f"   📤 Forwarding to Rank {next_rank} ({self.ring_position.next_node_id[:16]}...)"
+            )
+
             await self._send_to_node(
                 target_node_id=self.ring_position.next_node_id,
                 data=current_data,
                 request_id=request_id,
-                is_final=False
+                is_final=False,
             )
             return None
-    
+
     async def handle_incoming_tensor(
         self,
         sender_id: str,
         request_id: str,
         tensor_data: np.ndarray,
         shard: Shard,
-        is_final: bool = False
+        is_final: bool = False,
     ):
         """
         Handle incoming tensor from previous node in ring.
-        
+
         This is called when receiving a "tensor_forward" message.
         Based on prima.cpp's llama_recv_tensors().
         """
         try:
-            logger.info(f"")
-            logger.info(f"📥 RECEIVED TENSOR IN RING COORDINATOR")
+            logger.info("")
+            logger.info("📥 RECEIVED TENSOR IN RING COORDINATOR")
             logger.info(f"   From: {sender_id[:16]}...")
             logger.info(f"   Request: {request_id}")
             logger.info(f"   Shape: {tensor_data.shape}")
             logger.info(f"   Is final: {is_final}")
-            logger.info(f"   My rank: {self.ring_position.rank if self.ring_position else '?'}")
-            
+            logger.info(
+                f"   My rank: {self.ring_position.rank if self.ring_position else '?'}"
+            )
+
             # Restore or create state
             if request_id in self.active_requests:
                 state = self.active_requests[request_id]
@@ -562,31 +585,27 @@ class RingPipelineCoordinator:
                     current_cycle=0,
                     total_cycles=1,
                     current_layer=0,
-                    metadata={}
+                    metadata={},
                 )
                 self.active_requests[request_id] = state
-                logger.info(f"   Created new state")
-            
+                logger.info("   Created new state")
+
             state.hidden_states = tensor_data
-            
+
             if is_final and self.ring_position and self.ring_position.is_head:
                 # Final result received at head
-                logger.info(f"   ✅ Final result received at HEAD, returning")
+                logger.info("   ✅ Final result received at HEAD, returning")
                 return tensor_data
-            
+
             # Process and forward
-            logger.info(f"   → Processing and forwarding...")
+            logger.info("   → Processing and forwarding...")
             await self._process_and_forward(request_id, state, shard)
-            
+
         except Exception as e:
             logger.error(f"Error in handle_incoming_tensor: {e}", exc_info=True)
-    
+
     async def _send_to_node(
-        self,
-        target_node_id: str,
-        data: np.ndarray,
-        request_id: str,
-        is_final: bool
+        self, target_node_id: str, data: np.ndarray, request_id: str, is_final: bool
     ):
         """
         Send tensor to another node via Iroh.
@@ -596,19 +615,20 @@ class RingPipelineCoordinator:
         if not self.network.documents:
             logger.error("No documents available for communication")
             return
-        
+
         doc_id = next(iter(self.network.documents))
-        
+
         # Serialize and send
         import base64
+
         tensor_bytes = data.tobytes()
         tensor_b64 = base64.b64encode(tensor_bytes).decode("utf-8")
-        
+
         size_mb = len(tensor_bytes) / 1024 / 1024
         logger.info(f"   📤 Sending tensor: {size_mb:.2f} MB")
-        
+
         send_start = time.time()
-        
+
         message = {
             "type": "ring_tensor_forward",
             "sender_id": str(await self.network.iroh_node.net().node_id()),
@@ -622,12 +642,12 @@ class RingPipelineCoordinator:
             },
             "timestamp": time.time(),
         }
-        
+
         await self.network.send_message(doc_id, message)
-        
+
         send_time = time.time() - send_start
         logger.info(f"   ✅ Sent in {send_time*1000:.1f}ms")
-    
+
     def _find_head_node_id(self) -> str:
         """Find the head node (rank 0) ID."""
         # This should be stored during initialization
@@ -635,58 +655,55 @@ class RingPipelineCoordinator:
         topology_nodes = self.network.topology.all_nodes()
         if not topology_nodes:
             return self.network.topology.active_node_id or ""
-        
+
         # Head is the node with most memory (rank 0)
         sorted_nodes = sorted(
-            topology_nodes,
-            key=lambda x: (x[1].memory, x[0]),
-            reverse=True
+            topology_nodes, key=lambda x: (x[1].memory, x[0]), reverse=True
         )
         return sorted_nodes[0][0]
-    
+
     async def _prefetch_worker(self):
         """
         Background worker for prefetching model weights.
-        
+
         Based on prima.cpp's manage_graph_tensors() with POSIX_MADV_WILLNEED.
-        
+
         In Python, we can use:
         - mmap with MADV_WILLNEED
         - Preload model layers into cache
         - Async loading of next layers
         """
         logger.info("Prefetch worker started")
-        
+
         while True:
             try:
                 # Get next layer to prefetch
                 next_layer_id = await asyncio.wait_for(
-                    self.prefetch_queue.get(), 
-                    timeout=1.0
+                    self.prefetch_queue.get(), timeout=1.0
                 )
-                
+
                 # Prefetch logic here
                 # For transformers models, this would involve:
                 # 1. Identifying which weights are needed
                 # 2. Touching memory pages to bring into cache
                 # 3. Or pre-loading layers from disk
-                
+
                 logger.debug(f"Prefetching layer {next_layer_id}")
-                
+
                 # TODO: Implement actual prefetching
                 # For now, this is a placeholder
-                
+
             except asyncio.TimeoutError:
                 continue
             except Exception as e:
                 logger.error(f"Prefetch worker error: {e}")
                 await asyncio.sleep(1.0)
-    
+
     async def schedule_prefetch(self, layer_id: int):
         """Schedule a layer to be prefetched."""
         if not self.prefetch_queue.full():
             await self.prefetch_queue.put(layer_id)
-    
+
     async def shutdown(self):
         """Shutdown the ring coordinator."""
         if self.prefetch_task:
@@ -695,6 +712,5 @@ class RingPipelineCoordinator:
                 await self.prefetch_task
             except asyncio.CancelledError:
                 pass
-        
-        logger.info("Ring coordinator shutdown complete")
 
+        logger.info("Ring coordinator shutdown complete")

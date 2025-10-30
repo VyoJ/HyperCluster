@@ -7,9 +7,9 @@ from enum import Enum
 from typing import Any, Dict, Optional
 
 import numpy as np
+from ring_pipeline import RingPipelineCoordinator
 from shard import Shard
 from transformers_inference import TransformersShardedInferenceEngine
-from ring_pipeline import RingPipelineCoordinator
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +25,11 @@ class LLMService:
     """Manages LLM functionality in the P2P network with sharded inference support"""
 
     def __init__(
-        self, network, model_name="Qwen/Qwen2.5-0.5B-Instruct", use_sharding=True, use_ring=False
+        self,
+        network,
+        model_name="HuggingFaceTB/SmolLM2-135M-Instruct",
+        use_sharding=True,
+        use_ring=False,
     ):
         """Initialize LLM service"""
         self.network = network  # This is the Node object
@@ -35,6 +39,9 @@ class LLMService:
 
         # Sharded inference engine
         self.inference_engine: Optional[TransformersShardedInferenceEngine] = None
+
+        # Model will be auto-detected based on config
+        self.num_layers = None  # Will be set from model config
         self.current_shard: Optional[Shard] = None
 
         # Ring pipeline coordinator
@@ -56,8 +63,16 @@ class LLMService:
         self.max_generate_tokens = 256
         self.default_sample_temperature = 0.7
 
-    async def start(self, model_name: Optional[str] = None, num_layers: int = 24):
-        """Start the LLM service by loading the model"""
+    async def start(
+        self, model_name: Optional[str] = None, num_layers: Optional[int] = None
+    ):
+        """
+        Start the LLM service by loading the model.
+
+        Args:
+            model_name: Optional model name to override default
+            num_layers: Optional layer count (if None, auto-detect from model config)
+        """
         if model_name:
             self.model_name = model_name
             self.is_bitnet = "bitnet" in model_name.lower()
@@ -69,10 +84,34 @@ class LLMService:
         self.is_loading = True
 
         try:
+            # Auto-detect number of layers from model config if not provided
+            if num_layers is None:
+                logger.info(f"Auto-detecting model configuration for {self.model_name}")
+                from transformers import AutoConfig
+
+                config = AutoConfig.from_pretrained(self.model_name)
+
+                # Different models use different attribute names for layer count
+                if hasattr(config, "num_hidden_layers"):
+                    self.num_layers = config.num_hidden_layers
+                elif hasattr(config, "n_layer"):
+                    self.num_layers = config.n_layer
+                elif hasattr(config, "num_layers"):
+                    self.num_layers = config.num_layers
+                else:
+                    raise ValueError(
+                        f"Cannot determine number of layers for {self.model_name}"
+                    )
+
+                logger.info(f"✓ Detected {self.num_layers} layers in {self.model_name}")
+            else:
+                self.num_layers = num_layers
+                logger.info(f"Using specified layer count: {self.num_layers}")
+
             if self.use_sharding:
-                # Initialize sharded inference engine
-                await self._init_sharded_inference(num_layers)
-                
+                # Initialize sharded inference engine with detected layer count
+                await self._init_sharded_inference(self.num_layers)
+
                 # Initialize ring pipeline if enabled
                 if self.use_ring:
                     await self._init_ring_pipeline()
@@ -160,7 +199,7 @@ class LLMService:
         logger.debug(f"handle_llm_message called with type: {llm_type}")
 
         if llm_type == LLMMessageType.QUERY.value:
-            logger.debug(f"Routing to _handle_query")
+            logger.debug("Routing to _handle_query")
             await self._handle_query(message.get("sender_id"), payload)
         else:
             logger.debug(f"Ignoring llm_type: {llm_type}")
@@ -172,20 +211,22 @@ class LLMService:
         query_id = data.get("query_id")
         query = data.get("query")
 
-        logger.info(f"")
-        logger.info(f"📨 RECEIVED QUERY")
+        logger.info("")
+        logger.info("📨 RECEIVED QUERY")
         logger.info(f"   Query ID: {query_id}")
         logger.info(f"   Query: {query[:50] if query else 'None'}...")
         logger.info(f"   From: {sender_id[:16]}...")
-        logger.info(f"   Target: {target_node_id[:16] if target_node_id else 'broadcast'}...")
+        logger.info(
+            f"   Target: {target_node_id[:16] if target_node_id else 'broadcast'}..."
+        )
         logger.info(f"   My ID: {my_node_id[:16]}...")
 
         if target_node_id and target_node_id != my_node_id:
-            logger.info(f"   ↩️  Not for me, skipping")
+            logger.info("   ↩️  Not for me, skipping")
             return
 
         if not self.is_running or not self.is_loaded:
-            logger.warning(f"   ⚠️  Service not running or not loaded")
+            logger.warning("   ⚠️  Service not running or not loaded")
             error_response = {
                 "llm_type": LLMMessageType.STATUS.value,
                 "query_id": query_id,
@@ -196,17 +237,23 @@ class LLMService:
             return
 
         if not query:
-            logger.warning(f"   ⚠️  No query content")
+            logger.warning("   ⚠️  No query content")
             return
 
         # In ring mode, only HEAD node processes queries
         # Worker nodes only participate by processing ring tensor messages
-        if self.use_ring and self.ring_coordinator and self.ring_coordinator.ring_position:
+        if (
+            self.use_ring
+            and self.ring_coordinator
+            and self.ring_coordinator.ring_position
+        ):
             if not self.ring_coordinator.ring_position.is_head:
-                logger.info(f"   ↩️  Worker node (rank {self.ring_coordinator.ring_position.rank}) - skipping query, will participate in ring")
+                logger.info(
+                    f"   ↩️  Worker node (rank {self.ring_coordinator.ring_position.rank}) - skipping query, will participate in ring"
+                )
                 return
 
-        logger.info(f"   ✅ Processing query...")
+        logger.info("   ✅ Processing query...")
 
         status_update = {
             "llm_type": LLMMessageType.STATUS.value,
@@ -223,13 +270,13 @@ class LLMService:
 
         # Use ring pipeline, sharded, or single-node inference
         if self.use_ring and self.ring_coordinator:
-            logger.info(f"   🔁 Routing to ring pipeline")
+            logger.info("   🔁 Routing to ring pipeline")
             asyncio.create_task(self._process_query_ring(query_id, query))
         elif self.use_sharding:
-            logger.info(f"   📦 Routing to sharded inference")
+            logger.info("   📦 Routing to sharded inference")
             asyncio.create_task(self._process_query_sharded(query_id, query))
         else:
-            logger.info(f"   🔧 Routing to standard inference")
+            logger.info("   🔧 Routing to standard inference")
             asyncio.create_task(self._process_query(query_id, query))
 
     async def _process_query(self, query_id: str, query: str):
@@ -365,22 +412,24 @@ class LLMService:
             "payload": query_payload,
             "timestamp": time.time(),
         }
-        
+
         # Broadcast to network (for other nodes)
         success = await self.network.broadcast_message(message)
-        
+
         # IMPORTANT: In Iroh, nodes don't receive their own broadcasts!
         # So if this is a local query (no target or target is us), process it directly
         should_process_locally = (
-            llm_node_id is None or  # No specific target (broadcast to all)
-            llm_node_id == node_id_str  # Target is us
+            llm_node_id is None  # No specific target (broadcast to all)
+            or llm_node_id == node_id_str  # Target is us
         )
-        
+
         if should_process_locally and self.is_running and self.is_loaded:
-            logger.info(f"💡 Processing query locally (Iroh doesn't deliver own broadcasts)")
+            logger.info(
+                "💡 Processing query locally (Iroh doesn't deliver own broadcasts)"
+            )
             # Process locally
             await self._handle_query(node_id_str, query_payload)
-        
+
         if success:
             return query_id
         return None
@@ -394,8 +443,9 @@ class LLMService:
         # Create inference engine
         self.inference_engine = TransformersShardedInferenceEngine()
 
-        # Create base shard (full model)
-        base_shard = Shard(
+        # Create base shard (full model) - this represents the complete model spec
+        # needed by the ring coordinator to understand total layers
+        self.base_shard = Shard(
             model_id=self.model_name,
             start_layer=0,
             end_layer=num_layers - 1,
@@ -405,8 +455,8 @@ class LLMService:
         # Update topology
         await self.network.update_topology()
 
-        # Get this node's assigned shard
-        self.current_shard = await self.network.get_current_shard(base_shard)
+        # Get this node's assigned shard (specific layer range for this node)
+        self.current_shard = await self.network.get_current_shard(self.base_shard)
 
         if self.current_shard:
             logger.info(f"Node assigned shard: {self.current_shard}")
@@ -547,34 +597,33 @@ class LLMService:
     async def _init_ring_pipeline(self):
         """Initialize ring pipeline coordinator."""
         logger.info("Initializing ring pipeline mode...")
-        
+
         self.ring_coordinator = RingPipelineCoordinator(
-            inference_engine=self.inference_engine,
-            network_node=self.network
+            inference_engine=self.inference_engine, network_node=self.network
         )
-        
+
         # Broadcast topology update to let other nodes know we exist
         logger.info("Broadcasting topology update to discover peers...")
         await self.network.broadcast_topology_update()
-        
+
         # Wait for topology to be populated
         logger.info("Waiting for peer discovery...")
         await asyncio.sleep(3.0)  # Give more time for topology updates
-        
+
         topology_nodes = self.network.topology.all_nodes()
         logger.info(f"Found {len(topology_nodes)} nodes in topology")
-        
+
         if not topology_nodes:
             logger.warning("No topology nodes found after waiting, trying again...")
             await asyncio.sleep(2.0)
             topology_nodes = self.network.topology.all_nodes()
-        
+
         if topology_nodes:
             my_node_id = str(await self.network.iroh_node.net().node_id())
             await self.ring_coordinator.initialize_ring(
                 topology_nodes=topology_nodes,
                 my_node_id=my_node_id,
-                model_total_layers=self.current_shard.n_layers
+                model_total_layers=self.current_shard.n_layers,
             )
             logger.info(
                 f"Ring pipeline ready: rank={self.ring_coordinator.ring_position.rank}, "
@@ -582,42 +631,46 @@ class LLMService:
                 f"{self.ring_coordinator.layer_window.layer_end}]"
             )
         else:
-            logger.warning("Cannot initialize ring: no peers found, will run in single-node mode")
+            logger.warning(
+                "Cannot initialize ring: no peers found, will run in single-node mode"
+            )
             # Still initialize with just this node
             my_node_id = str(await self.network.iroh_node.net().node_id())
             topology_nodes = [(my_node_id, self.network.device_capabilities)]
             await self.ring_coordinator.initialize_ring(
                 topology_nodes=topology_nodes,
                 my_node_id=my_node_id,
-                model_total_layers=self.current_shard.n_layers
+                model_total_layers=self.current_shard.n_layers,
             )
 
     async def on_topology_update(self):
         """Handle topology updates - re-initialize ring if nodes join/leave."""
         if not self.use_ring or not self.ring_coordinator or not self.is_running:
             return
-        
+
         logger.info("")
         logger.info("=" * 80)
         logger.info("🔄 TOPOLOGY UPDATE DETECTED - RE-INITIALIZING RING")
         logger.info("=" * 80)
-        
+
         # Get updated topology
         topology_nodes = self.network.topology.all_nodes()
         logger.info(f"New topology size: {len(topology_nodes)} nodes")
-        
+
         if not topology_nodes:
-            logger.warning("Topology update resulted in empty topology, keeping current ring")
+            logger.warning(
+                "Topology update resulted in empty topology, keeping current ring"
+            )
             return
-        
+
         # Re-initialize ring with new topology
         my_node_id = str(await self.network.iroh_node.net().node_id())
-        
+
         try:
             await self.ring_coordinator.initialize_ring(
                 topology_nodes=topology_nodes,
                 my_node_id=my_node_id,
-                model_total_layers=self.current_shard.n_layers
+                model_total_layers=self.base_shard.n_layers,  # Use base_shard for full model spec
             )
             logger.info("Ring re-initialized successfully")
         except Exception as e:
@@ -629,24 +682,26 @@ class LLMService:
             if not self.ring_coordinator or not self.ring_coordinator.ring_position:
                 logger.error("Ring coordinator not initialized")
                 return
-            
+
             # Only head node starts generation
             if self.ring_coordinator.ring_position.is_head:
                 logger.info(f"Head node starting ring inference for: {query[:50]}...")
-                
+
+                # Pass base_shard (full model spec) to ring coordinator
+                # The ring coordinator will create node-specific shards from layer windows
                 generated_tokens = await self.ring_coordinator.start_inference(
                     request_id=query_id,
                     prompt=query,
-                    shard=self.current_shard,
-                    max_tokens=self.max_generate_tokens
+                    shard=self.base_shard,  # Full model spec, not node-specific shard
+                    max_tokens=self.max_generate_tokens,
                 )
-                
-                # Decode tokens to text
+
+                # Decode tokens to text using node's own shard
                 response_text = await self.inference_engine.decode(
-                    self.current_shard,
-                    np.array(generated_tokens)
+                    self.current_shard,  # Use current_shard for actual decoding
+                    np.array(generated_tokens),
                 )
-                
+
                 result = {
                     "llm_type": LLMMessageType.RESPONSE.value,
                     "query_id": query_id,
@@ -656,21 +711,24 @@ class LLMService:
                     "model": self.model_name,
                     "mode": "ring_pipeline",
                     "rank": self.ring_coordinator.ring_position.rank,
-                    "processing_time": time.time() - self.pending_queries.get(query_id, {}).get("timestamp", time.time())
+                    "processing_time": time.time()
+                    - self.pending_queries.get(query_id, {}).get(
+                        "timestamp", time.time()
+                    ),
                 }
-                
+
                 await self._send_llm_data(result)
-                
+
                 if query_id in self.pending_queries:
                     del self.pending_queries[query_id]
-                    
+
             else:
                 # Worker nodes participate in ring but don't initiate
                 logger.info(
                     f"Worker node (rank {self.ring_coordinator.ring_position.rank}) "
                     f"waiting for ring messages"
                 )
-        
+
         except Exception as e:
             logger.error(f"Ring inference error: {e}", exc_info=True)
             error_response = {

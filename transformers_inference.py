@@ -67,23 +67,13 @@ class TransformersShardedInferenceEngine(InferenceEngine):
         await self.ensure_shard(shard)
 
         def _encode():
-            # Use chat template if available (for models like Qwen)
-            if hasattr(self.tokenizer, 'apply_chat_template'):
-                messages = [
-                    {"role": "user", "content": prompt}
-                ]
-                # Apply chat template and tokenize
-                text = self.tokenizer.apply_chat_template(
-                    messages, 
-                    tokenize=False,
-                    add_generation_prompt=True
-                )
-                tokens = self.tokenizer.encode(text, add_special_tokens=False)
-            else:
-                # Fallback to simple encoding
-                tokens = self.tokenizer.encode(prompt, add_special_tokens=True)
-            
-            logger.info(f"Encoded '{prompt[:50]}...' to {len(tokens)} tokens: {tokens[:10]}...")
+            # Use simple encoding - chat template with add_generation_prompt=True
+            # adds trailing newlines that cause the model to generate only newlines
+            tokens = self.tokenizer.encode(prompt, add_special_tokens=True)
+
+            logger.info(
+                f"Encoded '{prompt[:50]}...' to {len(tokens)} tokens: {tokens[:10]}..."
+            )
             return np.array(tokens, dtype=np.int64)
 
         return await self._run_in_tokenizer_thread(_encode)
@@ -101,17 +91,19 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                     tokens_list = tokens.flatten().tolist()
             else:
                 tokens_list = [int(tokens)]
-            
+
             # Validate token IDs are in valid range
             vocab_size = len(self.tokenizer)
             valid_tokens = [t for t in tokens_list if 0 <= t < vocab_size]
             if len(valid_tokens) != len(tokens_list):
-                logger.warning(f"Found {len(tokens_list) - len(valid_tokens)} invalid tokens, filtering them out")
+                logger.warning(
+                    f"Found {len(tokens_list) - len(valid_tokens)} invalid tokens, filtering them out"
+                )
                 tokens_list = valid_tokens
-            
+
             if not tokens_list:
                 return ""
-            
+
             # Decode with skip_special_tokens to get clean output
             text = self.tokenizer.decode(tokens_list, skip_special_tokens=True)
             return text
@@ -167,8 +159,10 @@ class TransformersShardedInferenceEngine(InferenceEngine):
 
             token_id = int(next_token.item())
             logger.debug(f"Sampled token ID: {token_id} (shape: {next_token.shape})")
-            
-            return next_token.numpy().astype(np.int64)  # Changed to int64 to match encode
+
+            return next_token.numpy().astype(
+                np.int64
+            )  # Changed to int64 to match encode
 
         return await self._run_in_model_thread(_sample)
 
@@ -202,15 +196,6 @@ class TransformersShardedInferenceEngine(InferenceEngine):
 
             # Get cache state
             cache_state = self.caches.get(request_id, None)
-            
-            # SPECIAL CASE: If we receive logits (vocab-sized tensor), just return them
-            # This happens because we're running the full model each time, not layer-by-layer
-            if input_tensor.dim() == 3 and input_tensor.shape[-1] > 10000:  # Likely vocab size
-                vocab_size = self.tokenizer.vocab_size if self.tokenizer else input_tensor.shape[-1]
-                if input_tensor.shape[-1] == vocab_size or input_tensor.shape[-1] > 50000:
-                    logger.info(f"Detected logits input (shape {input_tensor.shape}), returning directly")
-                    # Already logits from previous pass, just return them
-                    return input_tensor.cpu().numpy()
 
             # Prepare inputs based on shard position and input shape
             if self.shard.is_first_layer() and input_tensor.dim() <= 2:
@@ -221,14 +206,41 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                 batch_size, seq_len = input_tensor.shape
 
                 # Create attention mask and position IDs
+                # Note: attention_mask should be bool or float, not long
                 attention_mask = torch.ones(
-                    batch_size, seq_len, dtype=torch.long, device=device
+                    batch_size, seq_len, dtype=torch.bool, device=device
                 )
-                position_ids = (
-                    torch.arange(seq_len, dtype=torch.long, device=device)
-                    .unsqueeze(0)
-                    .expand(batch_size, -1)
-                )
+
+                # Position IDs need to account for cached positions
+                if cache_state is not None and len(cache_state) > 0:
+                    # Get the cached sequence length from the first cache entry
+                    # past_key_values is a tuple of (key, value) tuples for each layer
+                    past_length = (
+                        cache_state[0][0].shape[2] if cache_state[0] is not None else 0
+                    )
+                    position_ids = (
+                        torch.arange(
+                            past_length,
+                            past_length + seq_len,
+                            dtype=torch.long,
+                            device=device,
+                        )
+                        .unsqueeze(0)
+                        .expand(batch_size, -1)
+                    )
+                    logger.debug(
+                        f"Created position_ids with cache: past_length={past_length}, position_ids={position_ids}"
+                    )
+                else:
+                    # No cache, start from 0
+                    position_ids = (
+                        torch.arange(seq_len, dtype=torch.long, device=device)
+                        .unsqueeze(0)
+                        .expand(batch_size, -1)
+                    )
+                    logger.debug(
+                        f"Created position_ids without cache: position_ids={position_ids}"
+                    )
 
                 inputs = {
                     "input_ids": input_tensor,
@@ -301,8 +313,15 @@ class TransformersShardedInferenceEngine(InferenceEngine):
         return output_data, inference_state
 
     async def ensure_shard(self, shard: Shard):
-        """Ensure the correct model shard is loaded."""
+        """
+        Ensure the correct model shard is loaded.
+
+        Note: In ring pipeline mode, each node loads its assigned shard once.
+        Subsequent calls with different shard specs (e.g., base_shard vs current_shard)
+        for the SAME model_id will reuse the already-loaded shard to avoid reloading.
+        """
         async with self._shard_lock:
+            # Quick check if already loaded
             if self.shard == shard:
                 return
 
@@ -310,13 +329,24 @@ class TransformersShardedInferenceEngine(InferenceEngine):
             # In future, this will download from a shard downloader
             model_id = shard.model_id
 
-            if self.shard != shard:
+            # Only reload if model_id changes, NOT if just layer range changes
+            # This allows ring pipeline to pass base_shard for coordination
+            # while keeping the node's assigned shard loaded
+            if self.shard is None or self.shard.model_id != shard.model_id:
                 await self._load_shard(model_id, shard)
                 self.shard = shard
 
-                # Clear caches and session when switching shards
+                # Clear caches and session when switching models
                 self.caches.clear()
                 self.session.clear()
+            else:
+                # Same model, different layer spec - don't reload
+                # This happens when ring pipeline passes base_shard
+                # but node already has current_shard loaded
+                logger.debug(
+                    f"Shard spec changed but same model_id, keeping loaded shard: "
+                    f"loaded={self.shard}, requested={shard}"
+                )
 
     async def _load_shard(self, model_id: str, shard: Shard):
         """Load model shard and tokenizer."""
@@ -380,15 +410,13 @@ class TransformersShardedInferenceEngine(InferenceEngine):
         """
         Wrap model to only execute assigned layers.
 
-        This is a simplified version - in production, you'd want to:
-        1. Only load weights for assigned layers
-        2. Properly handle layer extraction for different model architectures
-        3. Implement custom forward passes for each shard type
+        Uses the TransformersShard wrapper to extract and execute only
+        the layers assigned to this shard.
         """
-        # For now, return the full model
-        # TODO: Implement layer extraction and sharded forward pass
-        logger.warning("Full model loaded - layer extraction not yet implemented")
-        return model
+        from sharded_model import TransformersShard
+
+        logger.info(f"Wrapping model in shard: {shard}")
+        return TransformersShard(model, shard)
 
     def _create_device_map_for_shard(self, shard: Shard) -> Union[str, Dict[str, Any]]:
         """Create device map for the specific shard."""
