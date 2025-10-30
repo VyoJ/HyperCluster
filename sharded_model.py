@@ -276,12 +276,25 @@ class TransformersShard:
                     raise ValueError(
                         "First shard requires either input_ids or inputs_embeds"
                     )
+                logger.info(f"🔍 EMBEDDING DEBUG:")
+                logger.info(f"   input_ids shape: {input_ids.shape}")
+                logger.info(f"   embed_tokens weight shape: {self.embed_tokens.weight.shape}")
+                logger.info(f"   Expected: (vocab_size={self.config.vocab_size}, hidden_size={self.config.hidden_size})")
+                
                 hidden_states = self.embed_tokens(input_ids)
+                
+                logger.info(f"   Actual hidden_states shape: {hidden_states.shape}")
+                logger.info(f"   Expected hidden_states shape: ({input_ids.shape[0]}, {input_ids.shape[1]}, {self.config.hidden_size})")
             else:
                 hidden_states = inputs_embeds
         else:
             # Non-first shard: expect hidden states from previous shard
             if inputs_embeds is not None:
+                logger.info(f"🔍 WORKER SHARD DEBUG:")
+                logger.info(f"   Received inputs_embeds shape: {inputs_embeds.shape}")
+                logger.info(f"   Expected shape: (batch_size, seq_len, {self.config.hidden_size})")
+                logger.info(f"   This shard handles layers: {self.start_layer} to {self.end_layer}")
+                
                 hidden_states = inputs_embeds
             elif input_ids is not None:
                 raise ValueError(
