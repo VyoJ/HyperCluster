@@ -631,22 +631,31 @@ class RingPipelineCoordinator:
         logger.info(f"   📤 Target: {target_node_id[:16]}...")
         logger.info(f"   📤 Request ID: {request_id}")
 
-        # Step 1: Add tensor as Iroh blob (this handles large data efficiently)
-        blob_start = time.time()
-        add_outcome = await self.network.iroh_node.blobs().add_bytes(tensor_bytes)
-        blob_hash = add_outcome.hash
-        blob_time = time.time() - blob_start
+        # Store tensor directly in document as a binary entry
+        # This ensures it syncs to all peers automatically
+        doc = self.network.documents[doc_id]
+        author = await self.network.iroh_node.authors().default()
         
-        logger.info(f"   ✅ Tensor stored as blob: {str(blob_hash)[:16]}... in {blob_time*1000:.1f}ms")
+        # Create unique key for this tensor
+        tensor_key = f"tensor-{request_id}-{time.time()}".encode("utf-8")
+        
+        logger.info(f"   📝 Writing tensor to document as binary entry...")
+        write_start = time.time()
+        await doc.set_bytes(author, tensor_key, tensor_bytes)
+        write_time = time.time() - write_start
+        logger.info(f"   ✅ Tensor written to document in {write_time*1000:.1f}ms")
 
-        # Step 2: Send small metadata message with blob hash through document
+        # Small delay to allow sync
+        await asyncio.sleep(0.5)
+
+        # Send metadata message with tensor key
         message = {
             "type": "ring_tensor_forward",
             "sender_id": str(await self.network.iroh_node.net().node_id()),
             "target_node_id": target_node_id,
             "request_id": request_id,
             "payload": {
-                "blob_hash": str(blob_hash),  # Just the hash, not the data!
+                "tensor_key": tensor_key.decode("utf-8"),  # Key to fetch tensor from document
                 "tensor_shape": list(data.shape),
                 "tensor_dtype": str(data.dtype),
                 "tensor_size": len(tensor_bytes),
@@ -659,7 +668,7 @@ class RingPipelineCoordinator:
         
         send_time = time.time() - send_start
         if success:
-            logger.info(f"   ✅ Metadata sent in {send_time*1000:.1f}ms (total)")
+            logger.info(f"   ✅ Tensor sent in {send_time*1000:.1f}ms (total)")
         else:
             logger.error(f"   ❌ Failed to send message!")
         

@@ -487,10 +487,10 @@ class Node:
                 logger.warning("   ⚠️  LLM service not running")
                 return
             
-            # Get blob hash and metadata
-            blob_hash_str = payload.get("blob_hash", "")
-            if not blob_hash_str:
-                logger.error("   ❌ No blob hash in message")
+            # Get tensor key and metadata
+            tensor_key_str = payload.get("tensor_key", "")
+            if not tensor_key_str:
+                logger.error("   ❌ No tensor key in message")
                 return
             
             tensor_shape = tuple(payload.get("tensor_shape", []))
@@ -498,20 +498,51 @@ class Node:
             tensor_size = payload.get("tensor_size", 0)
             is_final = payload.get("is_final", False)
             
-            logger.info(f"   Blob hash: {blob_hash_str[:16]}...")
+            logger.info(f"   Tensor key: {tensor_key_str[:32]}...")
             logger.info(f"   Tensor shape: {tensor_shape}, dtype: {tensor_dtype}, size: {tensor_size/1024/1024:.2f}MB")
             logger.info(f"   Is final: {is_final}")
             
-            # Fetch tensor blob from Iroh
-            from iroh import Hash
-            blob_hash = Hash.from_string(blob_hash_str)
+            # Fetch tensor from document by key
+            # The sender stored it as a document entry, so it should sync automatically
+            fetch_start = time.time()
+            logger.info(f"   📥 Fetching tensor from document...")
             
-            blob_start = time.time()
-            logger.info(f"   📥 Fetching tensor blob...")
-            tensor_bytes = await self.iroh_node.blobs().read_to_bytes(blob_hash)
-            blob_time = time.time() - blob_start
+            # Get the document
+            doc_id = next(iter(self.documents))
+            doc = self.documents[doc_id]
             
-            logger.info(f"   ✅ Blob fetched: {len(tensor_bytes)} bytes in {blob_time*1000:.1f}ms")
+            # Wait a bit for sync if needed
+            max_wait = 5.0  # seconds
+            wait_start = time.time()
+            tensor_bytes = None
+            
+            while time.time() - wait_start < max_wait:
+                try:
+                    # Try to get the entry
+                    import iroh
+                    author = await self.iroh_node.authors().default()
+                    query = iroh.Query.author_key_exact(author, tensor_key_str.encode("utf-8"))
+                    entry = await doc.get_one(query)
+                    
+                    if entry:
+                        # Found it! Read the tensor bytes
+                        content_hash = entry.content_hash()
+                        tensor_bytes = await self.iroh_node.blobs().read_to_bytes(content_hash)
+                        logger.info(f"   ✅ Tensor fetched from document: {len(tensor_bytes)} bytes")
+                        break
+                    else:
+                        # Not synced yet, wait a bit
+                        await asyncio.sleep(0.1)
+                except Exception as e:
+                    logger.debug(f"   ⏳ Waiting for tensor to sync... ({e})")
+                    await asyncio.sleep(0.1)
+            
+            if tensor_bytes is None:
+                logger.error(f"   ❌ Timeout waiting for tensor to sync from document")
+                return
+            
+            fetch_time = time.time() - fetch_start
+            logger.info(f"   ✅ Tensor retrieved in {fetch_time*1000:.1f}ms")
             
             # Reconstruct tensor
             tensor = np.frombuffer(tensor_bytes, dtype=tensor_dtype).reshape(tensor_shape)
