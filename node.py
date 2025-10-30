@@ -525,14 +525,23 @@ class Node:
             
             while time.time() - wait_start < max_wait:
                 try:
-                    # Try to get the entry - use ANY author since it comes from remote peer
+                    # Query for entries with this key (from any author)
                     import iroh
-                    query = iroh.Query.key_exact(tensor_key_str.encode("utf-8"))
-                    entry = await doc.get_one(query)
+                    tensor_key_bytes = tensor_key_str.encode("utf-8")
                     
-                    if entry:
+                    # Get all entries and find the one with our key
+                    entries = await doc.get_many(iroh.Query.all())
+                    
+                    found_entry = None
+                    for entry in entries:
+                        if entry.key() == tensor_key_bytes:
+                            found_entry = entry
+                            logger.debug(f"   ✅ Found entry with key {tensor_key_str[:32]}...")
+                            break
+                    
+                    if found_entry:
                         # Found it! Read the tensor bytes
-                        content_hash = entry.content_hash()
+                        content_hash = found_entry.content_hash()
                         tensor_bytes = await self.iroh_node.blobs().read_to_bytes(content_hash)
                         logger.info(f"   ✅ Tensor fetched from document: {len(tensor_bytes)} bytes")
                         break
