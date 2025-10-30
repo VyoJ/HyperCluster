@@ -479,17 +479,15 @@ class RingPipelineCoordinator:
 
             compute_start = time.time()
 
-            # IMPORTANT: Create a node_shard for this node's assigned window!
-            node_shard = Shard(
-                model_id=shard.model_id,
-                start_layer=self.layer_window.layer_start,
-                end_layer=self.layer_window.layer_end,
-                n_layers=shard.n_layers,
-            )
-            # Run inference on assigned layers using this node's shard ONLY
+            # NOTE: Do NOT create a new shard here!
+            # The inference engine already has the correct shard loaded for this node
+            # from initialization. We just pass the base shard spec for reference.
+            # The actual layer filtering happens in the loaded model.
+
+            # Run inference on assigned layers using the already-loaded sharded model
             output_data, new_state = await self.inference_engine.infer_tensor(
                 request_id=request_id,
-                shard=node_shard,
+                shard=shard,  # Use base shard, inference engine has correct shard loaded
                 input_data=current_data,
                 inference_state=state.metadata,
             )
