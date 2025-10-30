@@ -419,18 +419,25 @@ class RingPipelineCoordinator:
         result = await self._process_and_forward(request_id, state, shard)
 
         # Wait for completion (result comes back from ring)
-        timeout = 30.0  # seconds
+        timeout = 60.0  # seconds - increased for large message sync
         start_time = time.time()
 
+        logger.info(f"   ⏳ Waiting for ring completion (timeout={timeout}s)...")
         while time.time() - start_time < timeout:
             if state.current_layer >= shard.n_layers:
                 # All layers processed
                 elapsed = time.time() - start_time
                 logger.info(f"   ✅ All layers processed in {elapsed*1000:.1f}ms")
                 break
-            await asyncio.sleep(0.1)
+            
+            # Log progress every 5 seconds
+            elapsed = time.time() - start_time
+            if int(elapsed) % 5 == 0 and elapsed > 0:
+                logger.info(f"   ⏱️  Still waiting... {elapsed:.0f}s elapsed, current_layer={state.current_layer}/{shard.n_layers}")
+            
+            await asyncio.sleep(0.5)
         else:
-            logger.error("   ⚠️  Timeout waiting for ring completion!")
+            logger.error(f"   ⚠️  Timeout waiting for ring completion! State: layer={state.current_layer}/{shard.n_layers}")
 
         # Clean up
         self.active_requests.pop(request_id, None)

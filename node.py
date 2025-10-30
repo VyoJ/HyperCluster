@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import time
@@ -165,16 +166,24 @@ class Node:
     async def handle_content_ready(self, doc: iroh.Doc, content_hash: iroh.Hash):
         """Handle new content received in a document."""
         try:
-            logger.debug(f"📦 Content ready event received, hash={str(content_hash)[:16]}...")
+            hash_str = str(content_hash)
+            logger.debug(f"📦 Content ready event received, hash={hash_str[:16]}...")
             content = await self.iroh_node.blobs().read_to_bytes(content_hash)
-            logger.debug(f"📦 Read {len(content)} bytes from blob")
+            content_size = len(content)
+            logger.info(f"📦 Read {content_size} bytes from blob (hash={hash_str[:16]}...)")
+            
             message_data = json.loads(content.decode("utf-8"))
             
-            # DIAGNOSTIC: Log received content
+            # DIAGNOSTIC: Log received content with size
             msg_type = message_data.get("type", "unknown")
             sender = message_data.get("sender_id", "unknown")
             sender_short = sender[:16] if sender and len(sender) > 16 else sender
-            logger.debug(f"📨 Content ready: type={msg_type}, from={sender_short}...")
+            
+            # Highlight large messages (likely tensor forwards)
+            if content_size > 100000:  # > 100KB
+                logger.info(f"📨 ⚡ LARGE MESSAGE: type={msg_type}, from={sender_short}..., size={content_size/1024/1024:.2f}MB")
+            else:
+                logger.debug(f"📨 Content ready: type={msg_type}, from={sender_short}..., size={content_size} bytes")
 
             logger.debug(f"📨 Calling {len(self.message_handlers)} message handler(s)...")
             for handler in self.message_handlers:
@@ -197,13 +206,25 @@ class Node:
             key = f"message-{time.time()}".encode("utf-8")
             payload_json = json.dumps(message)
             payload = payload_json.encode("utf-8")
+            payload_size = len(payload)
             
             msg_type = message.get("type", "unknown")
-            logger.debug(f"📤 Writing to doc {doc_id[:16]}...: type={msg_type}, size={len(payload)} bytes")
+            
+            # Highlight large messages
+            if payload_size > 100000:  # > 100KB
+                logger.info(f"📤 Writing LARGE message to doc {doc_id[:16]}...: type={msg_type}, size={payload_size/1024/1024:.2f}MB")
+            else:
+                logger.debug(f"📤 Writing to doc {doc_id[:16]}...: type={msg_type}, size={payload_size} bytes")
             
             await doc.set_bytes(author, key, payload)
             
             logger.debug(f"✅ Successfully wrote message to document")
+            
+            # For large messages, add a small delay to allow sync
+            if payload_size > 100000:
+                logger.info(f"⏳ Waiting 1s for large message to sync...")
+                await asyncio.sleep(1.0)
+            
             return True
         except Exception as e:
             logger.error(f"Failed to send message: {e}", exc_info=True)
