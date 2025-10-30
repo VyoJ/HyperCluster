@@ -411,31 +411,34 @@ class TransformersShard:
         is_last = self.shard.is_last_layer()
 
         # Debug logging
-        logger.debug(
-            f"Shard check: start={self.shard.start_layer}, end={self.shard.end_layer}, "
+        logger.info(
+            f"🔍 Shard check: start={self.shard.start_layer}, end={self.shard.end_layer}, "
             f"n_layers={self.shard.n_layers}, is_last={is_last}"
         )
+        logger.info(f"   Hidden states shape before final processing: {hidden_states.shape}")
 
         if is_last:
+            logger.info(f"   ✅ IS LAST SHARD - Applying LM head")
             # Apply final norm if available
             if self.norm is not None:
                 hidden_states = self.norm(hidden_states)
+                logger.info(f"   After norm: {hidden_states.shape}")
 
             # Apply lm_head to get logits
             if self.lm_head is not None:
-                logger.debug(
-                    f"Applying LM head: hidden_states shape {hidden_states.shape}"
+                logger.info(
+                    f"   Applying LM head: hidden_states shape {hidden_states.shape}"
                 )
                 logits = self.lm_head(hidden_states)
                 # Ensure logits are float32 for numerical stability
                 logits = logits.float()
-                logger.debug(f"LM head output shape: {logits.shape}")
+                logger.info(f"   LM head output shape: {logits.shape}")
             else:
                 logits = hidden_states
         else:
             # For non-last shards, output is hidden states
-            logger.debug(
-                f"Not last shard, returning hidden states with shape {hidden_states.shape}"
+            logger.info(
+                f"   ❌ NOT LAST SHARD - Returning hidden states with shape {hidden_states.shape}"
             )
             logits = hidden_states
 

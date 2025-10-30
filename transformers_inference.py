@@ -354,12 +354,18 @@ class TransformersShardedInferenceEngine(InferenceEngine):
         def _load():
             from transformers import AutoConfig, AutoModelForCausalLM
 
-            logger.info(f"Loading shard {shard} for model {model_id}")
+            logger.info(f"🔧 Loading shard {shard} for model {model_id}")
 
             # Load config first
             config = AutoConfig.from_pretrained(
                 model_id, cache_dir=self.cache_dir, trust_remote_code=True
             )
+            
+            logger.info(f"📋 Model Config:")
+            logger.info(f"   Model type: {config.model_type}")
+            logger.info(f"   Hidden size: {config.hidden_size}")
+            logger.info(f"   Num layers: {config.num_hidden_layers}")
+            logger.info(f"   Vocab size: {config.vocab_size}")
 
             # Get device and dtype configuration
             device_map = self._create_device_map_for_shard(shard)
