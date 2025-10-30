@@ -21,6 +21,11 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 
+# Enable DEBUG for critical message routing components
+logging.getLogger("message_handler").setLevel(logging.DEBUG)
+logging.getLogger("node").setLevel(logging.DEBUG)
+logging.getLogger("ring_pipeline").setLevel(logging.DEBUG)
+
 # Global state
 node: Optional[Node] = None
 llm_service: Optional[LLMService] = None
@@ -33,6 +38,10 @@ async def message_handler(message: dict):
     msg_type = message.get("type")
     sender_id = message.get("sender_id")
     payload = message.get("payload", {})
+    
+    # DIAGNOSTIC: Log ALL incoming messages
+    logger = logging.getLogger("message_handler")
+    logger.debug(f"📬 Message received: type={msg_type}, sender={sender_id[:16] if sender_id else 'none'}...")
 
     if msg_type == "text_message":
         console.print(
@@ -41,8 +50,11 @@ async def message_handler(message: dict):
         )
     elif msg_type == "ring_tensor_forward":
         # Handle ring pipeline tensor messages
+        logger.info(f"🔔 Routing ring_tensor_forward to handler")
         if node and llm_service:
             await node.handle_ring_tensor_message(message, llm_service)
+        else:
+            logger.warning(f"⚠️  Cannot handle ring tensor: node={node is not None}, llm_service={llm_service is not None}")
     elif msg_type == "topology_update":
         # Handle topology updates from peers
         if node:

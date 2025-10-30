@@ -13,7 +13,7 @@ import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from shard import Shard
@@ -89,7 +89,7 @@ class RingPipelineCoordinator:
 
     async def initialize_ring(
         self,
-        topology_nodes: List[Tuple[str, any]],
+        topology_nodes: List[Tuple[str, Any]],
         my_node_id: str,
         model_total_layers: int,
     ):
@@ -180,7 +180,7 @@ class RingPipelineCoordinator:
             self.prefetch_task = asyncio.create_task(self._prefetch_worker())
 
     def _calculate_layer_windows(
-        self, sorted_nodes: List[Tuple[str, any]], total_layers: int
+        self, sorted_nodes: List[Tuple[str, Any]], total_layers: int
     ) -> List[LayerWindow]:
         """
         Calculate layer windows for each node based on memory.
@@ -454,21 +454,11 @@ class RingPipelineCoordinator:
 
         layers_to_process = []
 
-        # In single-node mode, process ALL remaining layers at once
-        # to avoid intermediate LM head application
-        if self.ring_position and self.ring_position.world_size == 1:
-            # Process all remaining layers
-            for layer_id in range(state.current_layer, shard.n_layers):
-                if self.this_layer_is_mine(layer_id):
-                    layers_to_process.append(layer_id)
-        else:
-            # Multi-node: process in chunks for better pipelining
-            for layer_id in range(
-                state.current_layer,
-                min(state.current_layer + 10, shard.n_layers),  # Process in chunks
-            ):
-                if self.this_layer_is_mine(layer_id):
-                    layers_to_process.append(layer_id)
+        # In ring pipeline, each node should process ALL its assigned layers at once
+        # before forwarding to the next node
+        for layer_id in range(state.current_layer, shard.n_layers):
+            if self.this_layer_is_mine(layer_id):
+                layers_to_process.append(layer_id)
 
         if layers_to_process:
             logger.info("")
@@ -580,15 +570,19 @@ class RingPipelineCoordinator:
                 state = self.active_requests[request_id]
                 logger.info(f"   Restored existing state (layer {state.current_layer})")
             else:
+                # For new state, start from the beginning of our layer window
+                # This ensures we don't try to process layers that were already handled by previous nodes
+                start_layer = self.layer_window.layer_start if self.layer_window else 0
+                
                 state = InferenceState(
                     request_id=request_id,
                     current_cycle=0,
                     total_cycles=1,
-                    current_layer=0,
+                    current_layer=start_layer,  # Start from our window
                     metadata={},
                 )
                 self.active_requests[request_id] = state
-                logger.info("   Created new state")
+                logger.info(f"   Created new state starting at layer {start_layer}")
 
             state.hidden_states = tensor_data
 
@@ -626,6 +620,9 @@ class RingPipelineCoordinator:
 
         size_mb = len(tensor_bytes) / 1024 / 1024
         logger.info(f"   📤 Sending tensor: {size_mb:.2f} MB")
+        logger.info(f"   📤 Target: {target_node_id[:16]}...")
+        logger.info(f"   📤 Request ID: {request_id}")
+        logger.info(f"   📤 Doc ID: {doc_id[:16]}...")
 
         send_start = time.time()
 
@@ -643,10 +640,15 @@ class RingPipelineCoordinator:
             "timestamp": time.time(),
         }
 
-        await self.network.send_message(doc_id, message)
-
+        success = await self.network.send_message(doc_id, message)
+        
         send_time = time.time() - send_start
-        logger.info(f"   ✅ Sent in {send_time*1000:.1f}ms")
+        if success:
+            logger.info(f"   ✅ Sent in {send_time*1000:.1f}ms")
+        else:
+            logger.error(f"   ❌ Failed to send message!")
+        
+        return success
 
     def _find_head_node_id(self) -> str:
         """Find the head node (rank 0) ID."""

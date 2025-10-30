@@ -134,37 +134,54 @@ class Node:
     async def subscribe_to_doc_events(self, doc: iroh.Doc):
         """Subscribe to events for a given document."""
         doc_id_str = str(doc.id())
+        logger.info(f"🔔 Subscribing to events for document {doc_id_str[:16]}...")
 
         class SubscribeCallback:
-            def __init__(self, outer_instance, doc_id):
+            def __init__(self, outer_instance, doc_instance, doc_id):
                 self.outer = outer_instance
+                self.doc = doc_instance  # Store doc reference to avoid closure issues
                 self.doc_id = doc_id
 
             async def event(self, event):
-                if event.type() == LiveEventType.CONTENT_READY:
+                event_type = event.type()
+                logger.debug(f"🔔 Event received: {event_type} for doc {self.doc_id[:16]}...")
+                
+                if event_type == LiveEventType.CONTENT_READY:
                     hash_val = event.as_content_ready()
-                    await self.outer.handle_content_ready(doc, hash_val)
-                elif event.type() == LiveEventType.NEIGHBOR_UP:
+                    await self.outer.handle_content_ready(self.doc, hash_val)
+                elif event_type == LiveEventType.NEIGHBOR_UP:
                     peer_id = event.as_neighbor_up()
+                    logger.info(f"👋 Neighbor UP: {peer_id}")
                     self.outer.add_neighbor(self.doc_id, peer_id)
-                elif event.type() == LiveEventType.NEIGHBOR_DOWN:
+                elif event_type == LiveEventType.NEIGHBOR_DOWN:
                     peer_id = event.as_neighbor_down()
+                    logger.info(f"👋 Neighbor DOWN: {peer_id}")
                     self.outer.remove_neighbor(self.doc_id, peer_id)
 
-        callback = SubscribeCallback(self, doc_id_str)
+        callback = SubscribeCallback(self, doc, doc_id_str)
         await doc.subscribe(callback)
+        logger.info(f"✅ Subscribed to document {doc_id_str[:16]}...")
 
     async def handle_content_ready(self, doc: iroh.Doc, content_hash: iroh.Hash):
         """Handle new content received in a document."""
         try:
+            logger.debug(f"📦 Content ready event received, hash={str(content_hash)[:16]}...")
             content = await self.iroh_node.blobs().read_to_bytes(content_hash)
+            logger.debug(f"📦 Read {len(content)} bytes from blob")
             message_data = json.loads(content.decode("utf-8"))
+            
+            # DIAGNOSTIC: Log received content
+            msg_type = message_data.get("type", "unknown")
+            sender = message_data.get("sender_id", "unknown")
+            sender_short = sender[:16] if sender and len(sender) > 16 else sender
+            logger.debug(f"📨 Content ready: type={msg_type}, from={sender_short}...")
 
+            logger.debug(f"📨 Calling {len(self.message_handlers)} message handler(s)...")
             for handler in self.message_handlers:
                 await handler(message_data)
 
         except Exception as e:
-            logger.error(f"Error processing new content: {e}")
+            logger.error(f"Error processing new content: {e}", exc_info=True)
 
     async def send_message(self, doc_id: str, message: Dict[str, Any]):
         """Send a message by writing it to a document."""
@@ -178,11 +195,18 @@ class Node:
 
         try:
             key = f"message-{time.time()}".encode("utf-8")
-            payload = json.dumps(message).encode("utf-8")
+            payload_json = json.dumps(message)
+            payload = payload_json.encode("utf-8")
+            
+            msg_type = message.get("type", "unknown")
+            logger.debug(f"📤 Writing to doc {doc_id[:16]}...: type={msg_type}, size={len(payload)} bytes")
+            
             await doc.set_bytes(author, key, payload)
+            
+            logger.debug(f"✅ Successfully wrote message to document")
             return True
         except Exception as e:
-            logger.error(f"Failed to send message: {e}")
+            logger.error(f"Failed to send message: {e}", exc_info=True)
             return False
 
     async def broadcast_message(self, message: Dict[str, Any]):
@@ -408,11 +432,13 @@ class Node:
             # Check if this message is for us
             my_node_id = str(await self.iroh_node.net().node_id())
             
+            logger.info(f"   Checking target: target={target_node_id[:16] if target_node_id else 'broadcast'}..., me={my_node_id[:16]}...")
+            
             # Only process if:
             # 1. No target specified (broadcast), OR
             # 2. We are the target
             if target_node_id and target_node_id != my_node_id:
-                logger.debug(f"Ignoring ring tensor meant for {target_node_id[:8]}... (I am {my_node_id[:8]}...)")
+                logger.info(f"   ↩️  Ignoring ring tensor meant for {target_node_id[:16]}... (I am {my_node_id[:16]}...)")
                 return
             
             logger.info(f"")
