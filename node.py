@@ -181,7 +181,14 @@ class Node:
             content_size = len(content)
             logger.info(f"📦 Read {content_size} bytes from blob (hash={hash_str[:16]}...)")
             
-            message_data = json.loads(content.decode("utf-8"))
+            # Try to decode as JSON
+            try:
+                message_data = json.loads(content.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                # This is binary data (e.g., tensor), not a JSON message
+                # These are fetched explicitly by key, so we can skip them here
+                logger.debug(f"📦 Skipping binary content (not JSON message): {content_size} bytes")
+                return
             
             # DIAGNOSTIC: Log received content with size
             msg_type = message_data.get("type", "unknown")
@@ -518,10 +525,9 @@ class Node:
             
             while time.time() - wait_start < max_wait:
                 try:
-                    # Try to get the entry
+                    # Try to get the entry - use ANY author since it comes from remote peer
                     import iroh
-                    author = await self.iroh_node.authors().default()
-                    query = iroh.Query.author_key_exact(author, tensor_key_str.encode("utf-8"))
+                    query = iroh.Query.key_exact(tensor_key_str.encode("utf-8"))
                     entry = await doc.get_one(query)
                     
                     if entry:
@@ -532,10 +538,11 @@ class Node:
                         break
                     else:
                         # Not synced yet, wait a bit
-                        await asyncio.sleep(0.1)
+                        logger.debug(f"   ⏳ Entry not found yet, waiting... (elapsed: {time.time()-wait_start:.1f}s)")
+                        await asyncio.sleep(0.2)
                 except Exception as e:
                     logger.debug(f"   ⏳ Waiting for tensor to sync... ({e})")
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.2)
             
             if tensor_bytes is None:
                 logger.error(f"   ❌ Timeout waiting for tensor to sync from document")
