@@ -40,8 +40,8 @@ async def message_handler(message: dict):
     payload = message.get("payload", {})
     
     # DIAGNOSTIC: Log ALL incoming messages
-    logger = logging.getLogger("message_handler")
-    logger.debug(f"📬 Message received: type={msg_type}, sender={sender_id[:16] if sender_id else 'none'}...")
+    msg_logger = logging.getLogger("message_handler")
+    msg_logger.debug(f"📬 Message received: type={msg_type}, sender={sender_id[:16] if sender_id else 'none'}...")
 
     if msg_type == "text_message":
         console.print(
@@ -50,11 +50,11 @@ async def message_handler(message: dict):
         )
     elif msg_type == "ring_tensor_forward":
         # Handle ring pipeline tensor messages
-        logger.info(f"🔔 Routing ring_tensor_forward to handler")
+        msg_logger.info(f"🔔 Routing ring_tensor_forward to handler")
         if node and llm_service:
             await node.handle_ring_tensor_message(message, llm_service)
         else:
-            logger.warning(f"⚠️  Cannot handle ring tensor: node={node is not None}, llm_service={llm_service is not None}")
+            msg_logger.warning(f"⚠️  Cannot handle ring tensor: node={node is not None}, llm_service={llm_service is not None}")
     elif msg_type == "topology_update":
         # Handle topology updates from peers
         if node:
@@ -90,8 +90,7 @@ async def message_handler(message: dict):
             await llm_service.handle_llm_message(message)
         elif llm_type == LLMMessageType.QUERY.value:
             # Log if query received but service not running
-            import logging
-            logging.getLogger("main").warning(f"Received query but LLM service not running (llm_service={llm_service is not None}, running={llm_service.is_running if llm_service else False})")
+            msg_logger.warning(f"Received query but LLM service not running (llm_service={llm_service is not None}, running={llm_service.is_running if llm_service else False})")
 
 
 async def run_node(bootstrap_ticket: Optional[str] = None, use_ring: bool = False):
