@@ -325,11 +325,6 @@ class TransformersShard:
         # This is needed for Qwen2, Llama, and similar models
         position_embeddings = None
 
-        # Get logger for debugging
-        import logging
-
-        logger = logging.getLogger(__name__)
-
         if self.rotary_emb is not None:
             # Get sequence length
             batch_size, seq_length = hidden_states.shape[:2]
