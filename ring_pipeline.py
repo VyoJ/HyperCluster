@@ -55,6 +55,10 @@ class InferenceState:
     hidden_states: Optional[np.ndarray] = None
     kv_cache: Optional[Dict] = None
     metadata: Optional[Dict] = None
+    # Critical metadata for transformers (like prima.cpp's sync_meta)
+    position_ids: Optional[np.ndarray] = None  # Token positions for RoPE
+    attention_mask: Optional[np.ndarray] = None  # Attention mask for tokens
+    seq_len: int = 0  # Current sequence length
 
 
 class RingPipelineCoordinator:
@@ -150,9 +154,13 @@ class RingPipelineCoordinator:
         logger.info(f"   Node ID: {my_node_id[:16]}...")
         logger.info("")
         logger.info("🔄 Ring Structure:")
-        logger.info(f"   Previous: {prev_node_id[:16]}... (rank {(rank-1)%world_size})")
+        logger.info(
+            f"   Previous: {prev_node_id[:16]}... (rank {(rank - 1) % world_size})"
+        )
         logger.info(f"   Current:  {my_node_id[:16]}... (rank {rank})")
-        logger.info(f"   Next:     {next_node_id[:16]}... (rank {(rank+1)%world_size})")
+        logger.info(
+            f"   Next:     {next_node_id[:16]}... (rank {(rank + 1) % world_size})"
+        )
         logger.info("")
         logger.info("📊 My Layer Assignment:")
         logger.info(
@@ -214,7 +222,7 @@ class RingPipelineCoordinator:
 
             logger.info(
                 f"   Rank {rank}: {capabilities.memory:.1f} GB "
-                f"({memory_fraction*100:.1f}%) → {num_layers} layers"
+                f"({memory_fraction * 100:.1f}%) → {num_layers} layers"
             )
 
             window = LayerWindow(
@@ -282,6 +290,11 @@ class RingPipelineCoordinator:
         logger.info(f"Max tokens: {max_tokens}")
         logger.info(f"Model layers: {shard.n_layers}")
 
+        # Clear any existing cache for this request
+        # This ensures we start with clean state for new prompts
+        logger.info(f"Clearing any existing cache for request {request_id}")
+        self.inference_engine.caches.pop(request_id, None)
+
         # Encode prompt
         start_time = time.time()
         tokens = await self.inference_engine.encode(shard, prompt)
@@ -292,7 +305,7 @@ class RingPipelineCoordinator:
         logger.info("📝 Encoding complete:")
         logger.info(f"   Input tokens: {len(tokens)}")
         logger.info(f"   Token shape: {input_tokens.shape}")
-        logger.info(f"   Encode time: {encode_time*1000:.1f}ms")
+        logger.info(f"   Encode time: {encode_time * 1000:.1f}ms")
         logger.info("=" * 80)
 
         generated_tokens = []
@@ -306,8 +319,31 @@ class RingPipelineCoordinator:
             step_start = time.time()
 
             # Process through ring pipeline
+            # CRITICAL: Position calculation for autoregressive generation
+            # At the start of step N:
+            # - generated_tokens has N items (from steps 0..N-1)
+            # - input_tokens is the token we're ABOUT TO PROCESS
+            # - For step 0 (prompt): process all prompt tokens at positions [0, 1, 2, ..., len-1]
+            # - For step 1: process token sampled in step 0, which goes at position len(prompt) = 8
+            # - For step 2: process token sampled in step 1, which goes at position len(prompt) + 1 = 9
+            #
+            # Example with 8-token prompt:
+            # - Step 0: process prompt [0-7], sample token A → generated_tokens=[A]
+            # - Step 1: process token A (position 8), sample token B → generated_tokens=[A,B]
+            # - Step 2: process token B (position 9), sample token C → generated_tokens=[A,B,C]
+            #
+            # Formula: position = len(prompt) + (step - 1) for step > 0
+            current_position = (
+                len(tokens) + (step - 1)
+                if step > 0
+                else None  # For prompt pass, use positions [0, 1, 2, ..., len-1]
+            )
+
             logits = await self._ring_forward_pass(
-                request_id=request_id, input_data=input_tokens, shard=shard
+                request_id=request_id,
+                input_data=input_tokens,
+                shard=shard,
+                initial_position=current_position,  # Pass actual token position!
             )
 
             if logits is None:
@@ -326,7 +362,7 @@ class RingPipelineCoordinator:
             step_time = time.time() - step_start
 
             logger.info(f"   ✅ Token {step + 1} sampled: {token_id}")
-            logger.info(f"   ⏱️  Step time: {step_time*1000:.1f}ms")
+            logger.info(f"   ⏱️  Step time: {step_time * 1000:.1f}ms")
 
             # Show decoded text every 10 tokens
             if (step + 1) % 10 == 0 or step == 0:
@@ -367,7 +403,7 @@ class RingPipelineCoordinator:
         logger.info(f"   Total tokens: {len(generated_tokens)}")
         logger.info(f"   Total time: {total_time:.2f}s")
         logger.info(
-            f"   Avg token latency: {total_time/max(len(generated_tokens), 1)*1000:.1f}ms/token"
+            f"   Avg token latency: {total_time / max(len(generated_tokens), 1) * 1000:.1f}ms/token"
         )
         logger.info("=" * 80)
         logger.info("")
@@ -380,7 +416,11 @@ class RingPipelineCoordinator:
         return generated_tokens
 
     async def _ring_forward_pass(
-        self, request_id: str, input_data: np.ndarray, shard: Shard
+        self,
+        request_id: str,
+        input_data: np.ndarray,
+        shard: Shard,
+        initial_position: Optional[int] = None,
     ) -> Optional[np.ndarray]:
         """
         Execute one forward pass through the ring.
@@ -390,6 +430,12 @@ class RingPipelineCoordinator:
         2. Send to next node
         3. Receive from previous node (if not first cycle)
         4. Repeat until all layers processed
+
+        Args:
+            request_id: Unique request ID
+            input_data: Input token IDs or hidden states
+            shard: Model shard specification
+            initial_position: Starting position for this forward pass (for autoregressive generation)
 
         Returns:
             Final logits (head node only)
@@ -402,6 +448,31 @@ class RingPipelineCoordinator:
         logger.info(f"   Total cycles needed: {total_cycles}")
         logger.info(f"   Total layers: {shard.n_layers}")
 
+        # Initialize position_ids for the first node
+        # This is critical - like prima.cpp's inp_pos
+        batch_size = input_data.shape[0] if input_data.ndim >= 2 else 1
+        seq_len = input_data.shape[1] if input_data.ndim >= 2 else input_data.shape[0]
+
+        # CRITICAL FIX: Use initial_position if provided (for autoregressive generation)
+        # Otherwise create position IDs from 0
+        if initial_position is not None:
+            # For autoregressive generation: single token at specific position
+            # Example: if initial_position=256, position_ids = [256]
+            position_ids = np.array([[initial_position]], dtype=np.int64)
+            logger.info(f"   Using provided initial_position: {initial_position}")
+        else:
+            # For initial prompt: sequence of positions [0, 1, 2, ..., seq_len-1]
+            position_ids = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
+            position_ids = np.broadcast_to(position_ids, (batch_size, seq_len))
+            logger.info(f"   Created position_ids for prompt: [0..{seq_len - 1}]")
+
+        # Create attention mask: all ones (attend to all tokens)
+        attention_mask = np.ones((batch_size, seq_len), dtype=np.bool_)
+
+        logger.info(f"   Initialized position_ids shape: {position_ids.shape}")
+        logger.info(f"   Position_ids content: {position_ids}")
+        logger.info(f"   Initialized attention_mask shape: {attention_mask.shape}")
+
         # Initialize state
         state = InferenceState(
             request_id=request_id,
@@ -410,6 +481,9 @@ class RingPipelineCoordinator:
             current_layer=0,
             hidden_states=input_data,
             metadata={"step": 0},
+            position_ids=position_ids,  # Store position_ids
+            attention_mask=attention_mask,  # Store attention_mask
+            seq_len=seq_len,
         )
 
         self.active_requests[request_id] = state
@@ -427,17 +501,21 @@ class RingPipelineCoordinator:
             if state.current_layer >= shard.n_layers:
                 # All layers processed
                 elapsed = time.time() - start_time
-                logger.info(f"   ✅ All layers processed in {elapsed*1000:.1f}ms")
+                logger.info(f"   ✅ All layers processed in {elapsed * 1000:.1f}ms")
                 break
-            
+
             # Log progress every 5 seconds
             elapsed = time.time() - start_time
             if int(elapsed) % 5 == 0 and elapsed > 0:
-                logger.info(f"   ⏱️  Still waiting... {elapsed:.0f}s elapsed, current_layer={state.current_layer}/{shard.n_layers}")
-            
+                logger.info(
+                    f"   ⏱️  Still waiting... {elapsed:.0f}s elapsed, current_layer={state.current_layer}/{shard.n_layers}"
+                )
+
             await asyncio.sleep(0.5)
         else:
-            logger.error(f"   ⚠️  Timeout waiting for ring completion! State: layer={state.current_layer}/{shard.n_layers}")
+            logger.error(
+                f"   ⚠️  Timeout waiting for ring completion! State: layer={state.current_layer}/{shard.n_layers}"
+            )
 
         # Clean up
         self.active_requests.pop(request_id, None)
@@ -451,6 +529,11 @@ class RingPipelineCoordinator:
         Process assigned layers and forward to next node.
 
         Based on prima.cpp's layer processing loop in llama_decode_internal.
+
+        CRITICAL: Like prima.cpp, we need to:
+        1. Check which layers belong to this node (this_layer_is_mine)
+        2. Process ALL our layers in one batch
+        3. Update state.current_layer to point to the NEXT unprocessed layer globally
         """
         # Process layers in my window
         current_data = state.hidden_states
@@ -461,11 +544,17 @@ class RingPipelineCoordinator:
 
         layers_to_process = []
 
-        # In ring pipeline, each node should process ALL its assigned layers at once
-        # before forwarding to the next node
+        # Find all layers in our window that haven't been processed yet
+        # This matches prima.cpp's approach: iterate through ALL model layers,
+        # but only process the ones assigned to this node
         for layer_id in range(state.current_layer, shard.n_layers):
             if self.this_layer_is_mine(layer_id):
                 layers_to_process.append(layer_id)
+            elif layers_to_process:
+                # We've found layers that aren't ours after processing some of ours
+                # This means we've finished our contiguous block
+                # (This handles the case where layer windows are not perfectly aligned)
+                break
 
         if layers_to_process:
             logger.info("")
@@ -473,7 +562,13 @@ class RingPipelineCoordinator:
                 f"⚙️  Processing on Rank {self.ring_position.rank if self.ring_position else '?'}"
             )
             logger.info(
-                f"   Layers: {layers_to_process[0]} → {layers_to_process[-1]} ({len(layers_to_process)} layers)"
+                f"   Global layer IDs: {layers_to_process[0]} → {layers_to_process[-1]} ({len(layers_to_process)} layers)"
+            )
+            logger.info(
+                f"   My layer window: {self.layer_window.layer_start} → {self.layer_window.layer_end}"
+            )
+            logger.info(
+                f"   Current global progress: {state.current_layer}/{shard.n_layers}"
             )
             logger.info(f"   Input shape: {current_data.shape}")
 
@@ -490,19 +585,30 @@ class RingPipelineCoordinator:
                 shard=shard,  # Use base shard, inference engine has correct shard loaded
                 input_data=current_data,
                 inference_state=state.metadata,
+                position_ids=state.position_ids,  # Pass position_ids to inference
+                attention_mask=state.attention_mask,  # Pass attention_mask to inference
             )
 
             compute_time = time.time() - compute_start
 
             current_data = output_data
             state.hidden_states = current_data
+
+            # Update state.current_layer to point to the next unprocessed layer
+            # This is CRITICAL: we set it to one past the last layer we processed
+            # Prima.cpp does this implicitly in its layer loop
             state.current_layer = layers_to_process[-1] + 1
 
             logger.info(f"   Output shape: {output_data.shape}")
-            logger.info(f"   ⏱️  Compute time: {compute_time*1000:.1f}ms")
-            logger.info(f"   Next layer: {state.current_layer}/{shard.n_layers}")
+            logger.info(f"   ⏱️  Compute time: {compute_time * 1000:.1f}ms")
+            logger.info(
+                f"   Updated global progress: {state.current_layer}/{shard.n_layers}"
+            )
+            logger.info(f"   Layers remaining: {shard.n_layers - state.current_layer}")
         else:
-            logger.debug("   No layers to process in current chunk")
+            logger.debug(
+                f"   No layers to process in current chunk (current_layer={state.current_layer}, my_window={self.layer_window.layer_start}-{self.layer_window.layer_end})"
+            )
 
         # Check if this is the last layer
         is_final_layer = state.current_layer >= shard.n_layers
@@ -521,6 +627,8 @@ class RingPipelineCoordinator:
                     data=current_data,
                     request_id=request_id,
                     is_final=True,
+                    position_ids=state.position_ids,
+                    attention_mask=state.attention_mask,
                 )
                 return None
         else:
@@ -544,6 +652,8 @@ class RingPipelineCoordinator:
                 data=current_data,
                 request_id=request_id,
                 is_final=False,
+                position_ids=state.position_ids,
+                attention_mask=state.attention_mask,
             )
             return None
 
@@ -554,12 +664,17 @@ class RingPipelineCoordinator:
         tensor_data: np.ndarray,
         shard: Shard,
         is_final: bool = False,
+        position_ids: Optional[np.ndarray] = None,
+        attention_mask: Optional[np.ndarray] = None,
     ):
         """
         Handle incoming tensor from previous node in ring.
 
         This is called when receiving a "tensor_forward" message.
         Based on prima.cpp's llama_recv_tensors().
+
+        CRITICAL: Prima.cpp receives both hidden states AND position_ids.
+        Without position_ids, RoPE embeddings fail and attention is broken.
         """
         try:
             logger.info("")
@@ -571,6 +686,8 @@ class RingPipelineCoordinator:
             logger.info(
                 f"   My rank: {self.ring_position.rank if self.ring_position else '?'}"
             )
+            logger.info(f"   Has position_ids: {position_ids is not None}")
+            logger.info(f"   Has attention_mask: {attention_mask is not None}")
 
             # Restore or create state
             if request_id in self.active_requests:
@@ -580,18 +697,43 @@ class RingPipelineCoordinator:
                 # For new state, start from the beginning of our layer window
                 # This ensures we don't try to process layers that were already handled by previous nodes
                 start_layer = self.layer_window.layer_start if self.layer_window else 0
-                
+
                 state = InferenceState(
                     request_id=request_id,
                     current_cycle=0,
                     total_cycles=1,
                     current_layer=start_layer,  # Start from our window
                     metadata={},
+                    position_ids=position_ids,  # Store position_ids from sender
+                    attention_mask=attention_mask,  # Store attention_mask from sender
+                    seq_len=tensor_data.shape[1]
+                    if tensor_data.ndim >= 2
+                    else tensor_data.shape[0],
                 )
                 self.active_requests[request_id] = state
                 logger.info(f"   Created new state starting at layer {start_layer}")
 
             state.hidden_states = tensor_data
+            # Update position metadata if provided (allows updates during generation)
+            if position_ids is not None:
+                state.position_ids = position_ids
+            if attention_mask is not None:
+                state.attention_mask = attention_mask
+
+            # CRITICAL FIX: If current_layer is before our window, skip to our window start
+            # This handles the case where a previous node already processed its layers
+            # and we're receiving data mid-stream
+            if (
+                self.layer_window
+                and state.current_layer < self.layer_window.layer_start
+            ):
+                logger.info(
+                    f"   ⚠️  current_layer ({state.current_layer}) < our window start ({self.layer_window.layer_start})"
+                )
+                logger.info(
+                    f"   ↪️  Advancing to window start: {self.layer_window.layer_start}"
+                )
+                state.current_layer = self.layer_window.layer_start
 
             if is_final and self.ring_position and self.ring_position.is_head:
                 # Final result received at head
@@ -606,12 +748,23 @@ class RingPipelineCoordinator:
             logger.error(f"Error in handle_incoming_tensor: {e}", exc_info=True)
 
     async def _send_to_node(
-        self, target_node_id: str, data: np.ndarray, request_id: str, is_final: bool
+        self,
+        target_node_id: str,
+        data: np.ndarray,
+        request_id: str,
+        is_final: bool,
+        position_ids: Optional[np.ndarray] = None,
+        attention_mask: Optional[np.ndarray] = None,
     ):
         """
         Send tensor to another node via Iroh blobs.
         Based on prima.cpp's llama_send_tensors().
-        
+
+        Prima.cpp sends:
+        - sub_gf_out (hidden states)
+        - inp_pos (position IDs) - CRITICAL for RoPE embeddings
+        - attention_mask (implicitly via batch metadata)
+
         Uses Iroh's blob storage for large binary data (tensor),
         and sends only the blob hash through the document.
         """
@@ -623,7 +776,7 @@ class RingPipelineCoordinator:
         doc_id = next(iter(self.network.documents))
 
         send_start = time.time()
-        
+
         # Serialize tensor to bytes
         tensor_bytes = data.tobytes()
         size_mb = len(tensor_bytes) / 1024 / 1024
@@ -635,43 +788,53 @@ class RingPipelineCoordinator:
         # This ensures it syncs to all peers automatically
         doc = self.network.documents[doc_id]
         author = await self.network.iroh_node.authors().default()
-        
+
         # Create unique key for this tensor
         tensor_key = f"tensor-{request_id}-{time.time()}".encode("utf-8")
-        
-        logger.info(f"   📝 Writing tensor to document as binary entry...")
+
+        logger.info("   📝 Writing tensor to document as binary entry...")
         write_start = time.time()
         await doc.set_bytes(author, tensor_key, tensor_bytes)
         write_time = time.time() - write_start
-        logger.info(f"   ✅ Tensor written to document in {write_time*1000:.1f}ms")
+        logger.info(f"   ✅ Tensor written to document in {write_time * 1000:.1f}ms")
 
         # Small delay to allow sync
         await asyncio.sleep(0.5)
 
         # Send metadata message with tensor key
+        # IMPORTANT: Include position_ids and attention_mask like prima.cpp does
         message = {
             "type": "ring_tensor_forward",
             "sender_id": str(await self.network.iroh_node.net().node_id()),
             "target_node_id": target_node_id,
             "request_id": request_id,
             "payload": {
-                "tensor_key": tensor_key.decode("utf-8"),  # Key to fetch tensor from document
+                "tensor_key": tensor_key.decode(
+                    "utf-8"
+                ),  # Key to fetch tensor from document
                 "tensor_shape": list(data.shape),
                 "tensor_dtype": str(data.dtype),
                 "tensor_size": len(tensor_bytes),
                 "is_final": is_final,
+                # Critical metadata (like prima.cpp's inp_pos)
+                "position_ids": position_ids.tolist()
+                if position_ids is not None
+                else None,
+                "attention_mask": attention_mask.tolist()
+                if attention_mask is not None
+                else None,
             },
             "timestamp": time.time(),
         }
 
         success = await self.network.send_message(doc_id, message)
-        
+
         send_time = time.time() - send_start
         if success:
-            logger.info(f"   ✅ Tensor sent in {send_time*1000:.1f}ms (total)")
+            logger.info(f"   ✅ Tensor sent in {send_time * 1000:.1f}ms (total)")
         else:
-            logger.error(f"   ❌ Failed to send message!")
-        
+            logger.error("   ❌ Failed to send message!")
+
         return success
 
     def _find_head_node_id(self) -> str:

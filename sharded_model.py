@@ -276,25 +276,35 @@ class TransformersShard:
                     raise ValueError(
                         "First shard requires either input_ids or inputs_embeds"
                     )
-                logger.info(f"🔍 EMBEDDING DEBUG:")
+                logger.info("🔍 EMBEDDING DEBUG:")
                 logger.info(f"   input_ids shape: {input_ids.shape}")
-                logger.info(f"   embed_tokens weight shape: {self.embed_tokens.weight.shape}")
-                logger.info(f"   Expected: (vocab_size={self.config.vocab_size}, hidden_size={self.config.hidden_size})")
-                
+                logger.info(
+                    f"   embed_tokens weight shape: {self.embed_tokens.weight.shape}"
+                )
+                logger.info(
+                    f"   Expected: (vocab_size={self.config.vocab_size}, hidden_size={self.config.hidden_size})"
+                )
+
                 hidden_states = self.embed_tokens(input_ids)
-                
+
                 logger.info(f"   Actual hidden_states shape: {hidden_states.shape}")
-                logger.info(f"   Expected hidden_states shape: ({input_ids.shape[0]}, {input_ids.shape[1]}, {self.config.hidden_size})")
+                logger.info(
+                    f"   Expected hidden_states shape: ({input_ids.shape[0]}, {input_ids.shape[1]}, {self.config.hidden_size})"
+                )
             else:
                 hidden_states = inputs_embeds
         else:
             # Non-first shard: expect hidden states from previous shard
             if inputs_embeds is not None:
-                logger.info(f"🔍 WORKER SHARD DEBUG:")
+                logger.info("🔍 WORKER SHARD DEBUG:")
                 logger.info(f"   Received inputs_embeds shape: {inputs_embeds.shape}")
-                logger.info(f"   Expected shape: (batch_size, seq_len, {self.config.hidden_size})")
-                logger.info(f"   This shard handles layers: {self.start_layer} to {self.end_layer}")
-                
+                logger.info(
+                    f"   Expected shape: (batch_size, seq_len, {self.config.hidden_size})"
+                )
+                logger.info(
+                    f"   This shard handles layers: {self.start_layer} to {self.end_layer}"
+                )
+
                 hidden_states = inputs_embeds
             elif input_ids is not None:
                 raise ValueError(
@@ -304,10 +314,31 @@ class TransformersShard:
                 raise ValueError("Non-first shard must receive inputs_embeds")
 
         # Initialize past_key_values if needed
-        if past_key_values is None:
-            past_key_values = [None] * len(self.layers)
+        # Note: some models (Qwen3) expect a single Cache object shared across layers
+        # while others return per-layer tuples. Support both styles.
+        shared_cache_object = False
 
-        # Ensure we have the right number of cache entries
+        # CRITICAL FIX: For modern models (Qwen3), when use_cache=True and past_key_values=None,
+        # we need to create a DynamicCache object for layers to update in-place.
+        # Without this, layers won't return cache even with use_cache=True!
+        if past_key_values is None and use_cache:
+            from transformers import DynamicCache
+
+            past_key_values = DynamicCache()
+            shared_cache_object = True
+            logger.info("   🆕 Created new DynamicCache for use_cache=True")
+        elif past_key_values is None:
+            # use_cache=False, keep as None
+            past_key_values = None
+
+        # If we received a non-list/tuple (e.g., a Cache object), treat it as a shared cache
+        if (
+            not isinstance(past_key_values, (list, tuple))
+            and past_key_values is not None
+        ):
+            shared_cache_object = True
+
+        # If we have a per-layer list/tuple, ensure its length matches our layers
         if isinstance(past_key_values, (list, tuple)) and len(past_key_values) != len(
             self.layers
         ):
@@ -321,25 +352,59 @@ class TransformersShard:
                     len(self.layers) - len(past_key_values)
                 )
 
-        # Compute position embeddings if we have rotary embeddings
-        # This is needed for Qwen2, Llama, and similar models
-        position_embeddings = None
+        # Build an iterable of per-layer past_key_values to zip with layers.
+        # For shared cache objects (like Qwen3.Cache), use the same object for every layer.
+        if shared_cache_object:
+            per_layer_past = [past_key_values] * len(self.layers)
+        else:
+            # If past_key_values was None, create a per-layer list of None
+            per_layer_past = (
+                list(past_key_values)
+                if isinstance(past_key_values, (list, tuple))
+                else [None] * len(self.layers)
+            )
 
+        # Compute rotary position embeddings if model has rotary_emb
+        # This is required for Qwen3, Qwen2, Llama, etc.
+        position_embeddings = None
         if self.rotary_emb is not None:
-            # Get sequence length
             batch_size, seq_length = hidden_states.shape[:2]
 
-            # Create position_ids if not provided
-            if position_ids is None:
-                device = hidden_states.device
-                position_ids = torch.arange(seq_length, dtype=torch.long, device=device)
-                position_ids = position_ids.unsqueeze(0)
-                logger.debug(f"Shard wrapper created new position_ids: {position_ids}")
+            # CRITICAL FIX: Use cache_position for RoPE computation, NOT position_ids
+            # Modern transformers (4.36+) use cache_position as the authoritative position tracker
+            # and compute position_ids internally when needed. Passing both causes conflicts!
+            rope_position_ids = None
+            if cache_position is not None:
+                # cache_position is already 1D [seq_len], need to unsqueeze to [1, seq_len]
+                rope_position_ids = (
+                    cache_position.unsqueeze(0)
+                    if cache_position.dim() == 1
+                    else cache_position
+                )
+                logger.info(
+                    f"✅ Using cache_position for RoPE: {cache_position.tolist()}"
+                )
+            elif position_ids is not None:
+                # Fallback to position_ids if cache_position not available (legacy mode)
+                rope_position_ids = position_ids
+                logger.info(
+                    f"⚠️  Fallback: using position_ids for RoPE: {position_ids.tolist()}"
+                )
             else:
-                logger.debug(f"Shard wrapper received position_ids: {position_ids}")
+                # Last resort: create position_ids from sequence length
+                device = hidden_states.device
+                rope_position_ids = torch.arange(
+                    seq_length, dtype=torch.long, device=device
+                ).unsqueeze(0)
+                logger.info(
+                    f"⚠️  Created position_ids for RoPE (no cache_position or position_ids): {rope_position_ids.tolist()}"
+                )
 
-            # Compute rotary embeddings
-            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+            # Compute rotary embeddings using the appropriate position tensor
+            position_embeddings = self.rotary_emb(hidden_states, rope_position_ids)
+            logger.info(
+                f"✅ Computed position_embeddings for positions: {rope_position_ids.tolist()}"
+            )
 
         # Process through our shard's layers
         all_hidden_states = () if output_hidden_states else None
@@ -347,22 +412,26 @@ class TransformersShard:
         next_decoder_cache = []
 
         for layer_idx, (layer, past_key_value) in enumerate(
-            zip(self.layers, past_key_values)
+            zip(self.layers, per_layer_past)
         ):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
             # Prepare layer inputs
+            # CRITICAL: Don't pass position_ids when using cache_position!
+            # Modern transformers compute position_ids internally from cache_position.
+            # Passing both causes position mismatch and gibberish output.
             layer_kwargs = {
                 "hidden_states": hidden_states,
                 "attention_mask": attention_mask,
-                "position_ids": position_ids,
+                # CRITICAL: Qwen3 layer signature expects `past_key_value` (singular)
+                # not `past_key_values` (plural) - see layer forward signature
                 "past_key_value": past_key_value,
                 "output_attentions": output_attentions,
                 "use_cache": use_cache,
             }
 
-            # Add position_embeddings if we computed them
+            # Add position_embeddings if we computed them (required for Qwen3)
             if position_embeddings is not None:
                 layer_kwargs["position_embeddings"] = position_embeddings
 
@@ -372,24 +441,91 @@ class TransformersShard:
 
             # Forward through this layer
             # Different models have different signatures, so we try to be flexible
+            if layer_idx == 0:
+                logger.info(f"   Layer {layer_idx} kwargs: {list(layer_kwargs.keys())}")
+                logger.info(
+                    f"   🔍 CRITICAL: use_cache value being passed: {layer_kwargs['use_cache']}"
+                )
+                logger.info(
+                    f"   🔍 CRITICAL: past_key_value type: {type(layer_kwargs['past_key_value'])}"
+                )
+                logger.info(
+                    f"   🔍 CRITICAL: past_key_value value: {layer_kwargs['past_key_value']}"
+                )
+                # CRITICAL: Inspect the actual layer forward signature
+                import inspect
+
+                sig = inspect.signature(layer.forward)
+                logger.info(f"   🔍 Layer forward signature: {sig}")
+                logger.info(
+                    f"   🔍 Layer forward parameters: {list(sig.parameters.keys())}"
+                )
+
             try:
                 layer_outputs = layer(**layer_kwargs)
-            except TypeError:
+                if layer_idx == 0:
+                    logger.info(
+                        f"   Layer {layer_idx} output type: {type(layer_outputs)}"
+                    )
+                    if isinstance(layer_outputs, tuple):
+                        logger.info(
+                            f"   Layer {layer_idx} tuple length: {len(layer_outputs)}"
+                        )
+                        for i, item in enumerate(layer_outputs):
+                            logger.info(
+                                f"   Layer {layer_idx} output[{i}] type: {type(item)}, shape: {item.shape if hasattr(item, 'shape') else 'N/A'}"
+                            )
+            except TypeError as e:
                 # Try without cache_position if it fails
+                if layer_idx == 0:
+                    logger.info(f"   Layer {layer_idx}: TypeError on first call: {e}")
+                    logger.info("   Trying without cache_position...")
                 layer_kwargs.pop("cache_position", None)
-                layer_outputs = layer(**layer_kwargs)
+                try:
+                    layer_outputs = layer(**layer_kwargs)
+                except TypeError as e2:
+                    if layer_idx == 0:
+                        logger.info(
+                            f"   Layer {layer_idx}: TypeError on second call: {e2}"
+                        )
+                        logger.info(
+                            "   Layer signature might not support use_cache or other parameters"
+                        )
+                        logger.info("   Trying with minimal kwargs...")
+                    # Last resort: try with minimal parameters
+                    layer_outputs = layer(hidden_states, attention_mask=attention_mask)
 
             # Extract outputs
             if isinstance(layer_outputs, tuple):
                 hidden_states = layer_outputs[0]
 
-                if use_cache:
-                    # Cache is usually at index 1 (or 2 if attentions are output)
+                # CRITICAL FIX: Modern transformers (4.36+) don't return cache in layer outputs!
+                # Instead, layers update the shared Cache object in-place via cache.update()
+                # We should NOT try to extract cache from layer_outputs - it won't be there.
+                # The cache object (past_key_value) is being updated in-place during layer forward.
+
+                # Old behavior (kept for backward compatibility with older models):
+                # Some older models might still return cache in tuple format
+                if use_cache and not shared_cache_object:
+                    # Only try to extract if we're NOT using a shared cache object
                     cache_idx = 2 if output_attentions else 1
                     if len(layer_outputs) > cache_idx:
                         next_decoder_cache.append(layer_outputs[cache_idx])
+                        if layer_idx == 0:  # Log first layer only
+                            cache_shape = (
+                                layer_outputs[cache_idx][0].shape
+                                if isinstance(layer_outputs[cache_idx], tuple)
+                                else "not-tuple"
+                            )
+                            logger.info(
+                                f"   Layer {layer_idx}: extracted cache at index {cache_idx}, shape: {cache_shape}"
+                            )
                     else:
                         next_decoder_cache.append(None)
+                        if layer_idx == 0:  # Log first layer only
+                            logger.info(
+                                f"   Layer {layer_idx}: Layer returned tuple length {len(layer_outputs)} (modern transformers update cache in-place)"
+                            )
 
                 if output_attentions and len(layer_outputs) > 1:
                     all_self_attns += (layer_outputs[1],)
@@ -401,8 +537,21 @@ class TransformersShard:
                     else layer_outputs[0]
                 )
 
-                if use_cache and hasattr(layer_outputs, "past_key_value"):
-                    next_decoder_cache.append(layer_outputs.past_key_value)
+                # CRITICAL FIX: Same as above - modern transformers update cache in-place
+                # Only try to extract cache if NOT using shared cache object
+                if use_cache and not shared_cache_object:
+                    if hasattr(layer_outputs, "past_key_value"):
+                        next_decoder_cache.append(layer_outputs.past_key_value)
+                        if layer_idx == 0:  # Log first layer only
+                            logger.info(
+                                f"   Layer {layer_idx}: extracted cache from object.past_key_value"
+                            )
+                    else:
+                        next_decoder_cache.append(None)
+                        if layer_idx == 0:  # Log first layer only
+                            logger.info(
+                                f"   Layer {layer_idx}: Object output (modern transformers update cache in-place)"
+                            )
 
                 if output_attentions and hasattr(layer_outputs, "attentions"):
                     all_self_attns += (layer_outputs.attentions,)
@@ -415,10 +564,12 @@ class TransformersShard:
             f"🔍 Shard check: start={self.shard.start_layer}, end={self.shard.end_layer}, "
             f"n_layers={self.shard.n_layers}, is_last={is_last}"
         )
-        logger.info(f"   Hidden states shape before final processing: {hidden_states.shape}")
+        logger.info(
+            f"   Hidden states shape before final processing: {hidden_states.shape}"
+        )
 
         if is_last:
-            logger.info(f"   ✅ IS LAST SHARD - Applying LM head")
+            logger.info("   ✅ IS LAST SHARD - Applying LM head")
             # Apply final norm if available
             if self.norm is not None:
                 hidden_states = self.norm(hidden_states)
@@ -447,9 +598,59 @@ class TransformersShard:
             all_hidden_states += (hidden_states,)
 
         # Prepare cache output
-        next_cache = (
-            tuple(next_decoder_cache) if use_cache and next_decoder_cache else None
-        )
+        # CRITICAL FIX: For modern transformers with shared Cache objects,
+        # return the cache object that was passed in (it was updated in-place)
+        if use_cache:
+            if shared_cache_object:
+                # Modern transformers (4.36+): Cache object was updated in-place by layers
+                # Return the SAME object we passed in, now containing updated key/values
+                next_cache = past_key_values
+            elif next_decoder_cache:
+                # Old-style tuple cache (for backward compatibility)
+                next_cache = tuple(next_decoder_cache)
+            else:
+                # use_cache=True but no cache was created/extracted
+                next_cache = None
+        else:
+            next_cache = None
+
+        # Debug: log cache details
+        if next_cache is not None:
+            if shared_cache_object:
+                # For Cache objects, get sequence length from the cache itself
+                try:
+                    cache_seq_len = (
+                        next_cache.get_seq_length(0)
+                        if hasattr(next_cache, "get_seq_length")
+                        else "unknown"
+                    )
+                    cache_num_layers = (
+                        len(next_cache) if hasattr(next_cache, "__len__") else "unknown"
+                    )
+                    logger.info(
+                        f"   📦 Cache object returned: {cache_num_layers} layers, seq_len={cache_seq_len}"
+                    )
+                except Exception:
+                    logger.info(f"   📦 Cache object returned: {type(next_cache)}")
+            elif len(next_cache) > 0:
+                # Old-style tuple cache
+                if next_cache[0] is not None:
+                    cache_shape = (
+                        next_cache[0][0].shape
+                        if isinstance(next_cache[0], tuple)
+                        else "unknown"
+                    )
+                    logger.info(
+                        f"   📦 Cache tuple created: {len(next_cache)} layers, first layer cache shape: {cache_shape}"
+                    )
+                else:
+                    logger.info(
+                        f"   📦 Cache tuple created: {len(next_cache)} layers, but first layer cache is None"
+                    )
+        else:
+            logger.info(
+                f"   📦 No cache returned (use_cache={use_cache}, shared_cache={shared_cache_object})"
+            )
 
         # Return in requested format
         if not return_dict:

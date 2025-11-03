@@ -10,3 +10,7 @@ wheels/
 .venv
 
 model_cache/
+
+# Log files
+logs/
+*.log

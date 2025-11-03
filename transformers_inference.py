@@ -17,6 +17,39 @@ from shard import Shard
 logger = logging.getLogger(__name__)
 
 
+def _get_cache_seq_length(cache_state) -> int:
+    """
+    Get sequence length from cache state.
+
+    Supports both DynamicCache objects and tuple-based caches.
+
+    Args:
+        cache_state: Either a DynamicCache object or tuple of per-layer caches
+
+    Returns:
+        Sequence length of cached tokens (0 if no cache)
+    """
+    if cache_state is None:
+        return 0
+
+    # Check if it's a DynamicCache object
+    if hasattr(cache_state, "get_seq_length"):
+        return cache_state.get_seq_length()
+
+    # Check if it has key_cache attribute (DynamicCache alternative method)
+    if hasattr(cache_state, "key_cache") and len(cache_state.key_cache) > 0:
+        return cache_state.key_cache[0].shape[2]
+
+    # Fallback: tuple/list of per-layer caches
+    if isinstance(cache_state, (list, tuple)) and len(cache_state) > 0:
+        if cache_state[0] is not None:
+            # Tuple of (key, value) tensors
+            if isinstance(cache_state[0], (list, tuple)) and len(cache_state[0]) > 0:
+                return cache_state[0][0].shape[2]
+
+    return 0
+
+
 class TransformersShardedInferenceEngine(InferenceEngine):
     """
     Transformers-based inference engine with native shard support.
@@ -152,6 +185,15 @@ class TransformersShardedInferenceEngine(InferenceEngine):
 
                 # Sample from distribution
                 probs = torch.softmax(logits_tensor, dim=-1)
+
+                # DEBUG: Show top-5 predictions
+                top_probs, top_indices = torch.topk(probs[0], k=5)
+                logger.info("🎲 Top-5 predictions:")
+                for i, (prob, idx) in enumerate(zip(top_probs, top_indices)):
+                    logger.info(
+                        f"   {i + 1}. Token {idx.item()}: {prob.item():.4f} ({prob.item() * 100:.2f}%)"
+                    )
+
                 next_token = torch.multinomial(probs, num_samples=1)
             else:
                 # Greedy sampling
@@ -172,8 +214,15 @@ class TransformersShardedInferenceEngine(InferenceEngine):
         shard: Shard,
         input_data: np.ndarray,
         inference_state: Optional[Dict] = None,
+        position_ids: Optional[np.ndarray] = None,
+        attention_mask: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, Optional[Dict]]:
-        """Run inference on input tensor through the assigned shard."""
+        """
+        Run inference on input tensor through the assigned shard.
+
+        CRITICAL: Like prima.cpp, we MUST receive position_ids from the coordinator.
+        Without position_ids, RoPE (Rotary Position Embeddings) will fail.
+        """
         await self.ensure_shard(shard)
 
         # Get or initialize inference state
@@ -196,6 +245,15 @@ class TransformersShardedInferenceEngine(InferenceEngine):
 
             # Get cache state
             cache_state = self.caches.get(request_id, None)
+            past_length = _get_cache_seq_length(cache_state)
+            if past_length > 0:
+                logger.info(
+                    f"🔄 Loaded KV cache: {len(cache_state) if hasattr(cache_state, '__len__') else 'dynamic'} layers, seq_len={past_length}"
+                )
+            else:
+                logger.info(
+                    f"🆕 No cache found for request {request_id}, starting fresh"
+                )
 
             # Prepare inputs based on shard position and input shape
             if self.shard.is_first_layer() and input_tensor.dim() <= 2:
@@ -205,50 +263,143 @@ class TransformersShardedInferenceEngine(InferenceEngine):
 
                 batch_size, seq_len = input_tensor.shape
 
-                # Create attention mask and position IDs
-                # Note: attention_mask should be bool or float, not long
-                attention_mask = torch.ones(
-                    batch_size, seq_len, dtype=torch.bool, device=device
-                )
-
-                # Position IDs need to account for cached positions
-                if cache_state is not None and len(cache_state) > 0:
-                    # Get the cached sequence length from the first cache entry
-                    # past_key_values is a tuple of (key, value) tuples for each layer
-                    past_length = (
-                        cache_state[0][0].shape[2] if cache_state[0] is not None else 0
+                # Use provided position_ids and attention_mask if available
+                # Otherwise create them (for backward compatibility)
+                if position_ids is not None:
+                    # Convert from numpy to torch
+                    position_ids_tensor = (
+                        torch.from_numpy(position_ids).long().to(device)
                     )
-                    position_ids = (
-                        torch.arange(
-                            past_length,
-                            past_length + seq_len,
-                            dtype=torch.long,
-                            device=device,
-                        )
-                        .unsqueeze(0)
-                        .expand(batch_size, -1)
-                    )
-                    logger.debug(
-                        f"Created position_ids with cache: past_length={past_length}, position_ids={position_ids}"
+                    logger.info(
+                        f"Using provided position_ids: {position_ids_tensor.shape}"
                     )
                 else:
-                    # No cache, start from 0
-                    position_ids = (
-                        torch.arange(seq_len, dtype=torch.long, device=device)
-                        .unsqueeze(0)
-                        .expand(batch_size, -1)
+                    # Create attention mask and position IDs (fallback)
+                    # Note: attention_mask should be bool or float, not long
+
+                    # Position IDs need to account for cached positions
+                    past_length = _get_cache_seq_length(cache_state)
+                    if past_length > 0:
+                        position_ids_tensor = (
+                            torch.arange(
+                                past_length,
+                                past_length + seq_len,
+                                dtype=torch.long,
+                                device=device,
+                            )
+                            .unsqueeze(0)
+                            .expand(batch_size, -1)
+                        )
+                        logger.debug(
+                            f"Created position_ids with cache: past_length={past_length}, position_ids={position_ids_tensor}"
+                        )
+                    else:
+                        # No cache, start from 0
+                        position_ids_tensor = (
+                            torch.arange(seq_len, dtype=torch.long, device=device)
+                            .unsqueeze(0)
+                            .expand(batch_size, -1)
+                        )
+                        logger.debug(
+                            f"Created position_ids without cache: position_ids={position_ids_tensor}"
+                        )
+
+                if attention_mask is not None:
+                    # Convert from numpy to torch
+                    attention_mask_tensor = (
+                        torch.from_numpy(attention_mask).bool().to(device)
                     )
-                    logger.debug(
-                        f"Created position_ids without cache: position_ids={position_ids}"
+                    logger.info(
+                        f"Using provided attention_mask: {attention_mask_tensor.shape}"
                     )
 
+                    # CRITICAL: When we have KV cache, attention_mask needs to span the full sequence
+                    # including cached tokens. If the provided mask is only for new tokens,
+                    # we need to expand it to include cached positions.
+                    past_length = _get_cache_seq_length(cache_state)
+                    if past_length > 0 and attention_mask_tensor.shape[1] == seq_len:
+                        # attention_mask only covers new tokens, expand it
+                        # to cover cached tokens too (all ones for past tokens)
+                        past_mask = torch.ones(
+                            batch_size, past_length, dtype=torch.bool, device=device
+                        )
+                        attention_mask_tensor = torch.cat(
+                            [past_mask, attention_mask_tensor], dim=1
+                        )
+                        logger.info(
+                            f"📏 Expanded attention_mask for cache: {past_length} cached + {seq_len} new = {attention_mask_tensor.shape[1]} total"
+                        )
+                        # DEBUG: Check for any False values (masked positions)
+                        num_masked = (~attention_mask_tensor).sum().item()
+                        if num_masked > 0:
+                            logger.warning(
+                                f"⚠️  Attention mask has {num_masked} MASKED positions (False values)!"
+                            )
+                            logger.warning(
+                                f"   Attention mask: {attention_mask_tensor}"
+                            )
+                        else:
+                            logger.info(
+                                f"✅ Attention mask: all {attention_mask_tensor.shape[1]} positions UNMASKED (all True)"
+                            )
+                else:
+                    # Create default attention mask (all ones)
+                    # If we have cache, include cached positions
+                    past_length = _get_cache_seq_length(cache_state)
+                    if past_length > 0:
+                        total_len = past_length + seq_len
+                        attention_mask_tensor = torch.ones(
+                            batch_size, total_len, dtype=torch.bool, device=device
+                        )
+                        logger.debug(
+                            f"Created full attention_mask with cache: {total_len} tokens"
+                        )
+                    else:
+                        attention_mask_tensor = torch.ones(
+                            batch_size, seq_len, dtype=torch.bool, device=device
+                        )
+
+                # CRITICAL: Create cache_position for transformers models
+                # This tells the model which indices in the KV cache to update
+                # Without this, layers won't return cache!
+                past_length = _get_cache_seq_length(cache_state)
+                if past_length > 0:
+                    # We have existing cache, update the next positions
+                    # cache_position: indices into the cache [past_length, past_length+1, ...]
+                    cache_position = torch.arange(
+                        past_length,
+                        past_length + seq_len,
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    logger.info(
+                        f"🎯 Created cache_position: {cache_position.tolist()} (cache has {past_length} tokens)"
+                    )
+                else:
+                    # No cache yet, start from position 0
+                    cache_position = torch.arange(
+                        seq_len, dtype=torch.long, device=device
+                    )
+                    logger.info(
+                        f"🎯 Created cache_position: {cache_position.tolist()} (new cache)"
+                    )
+
+                # CRITICAL FIX: When using cache_position (modern transformers 4.36+),
+                # DO NOT pass position_ids - the model computes it internally from cache_position!
+                # Passing both can cause position mismatch issues.
+                # ALSO: Don't pass attention_mask - let the model create it internally
+                # (matching native transformers.generate() behavior)
                 inputs = {
                     "input_ids": input_tensor,
-                    "attention_mask": attention_mask,
-                    "position_ids": position_ids,
+                    # attention_mask NOT included - let model compute internally
+                    # position_ids NOT included - computed from cache_position internally
                     "past_key_values": cache_state,
                     "use_cache": True,
+                    "cache_position": cache_position,
                 }
+                logger.info(
+                    f"🔧 Using cache_position={cache_position.tolist()}, letting model compute position_ids and attention_mask internally"
+                )
             else:
                 # Middle/last shard: expects inputs_embeds (hidden states)
                 if input_tensor.dim() == 2:
@@ -271,26 +422,95 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                         f"Hidden size mismatch: expected {inference_state['hidden_size']}, got {hidden_size}"
                     )
 
+                # CRITICAL: Non-first shards also need position_ids and attention_mask!
+                # Prima.cpp passes inp_pos to ALL nodes, not just the first one.
                 inputs = {
                     "inputs_embeds": input_tensor,
                     "past_key_values": cache_state,
                     "use_cache": True,
                 }
 
+                # Add position_ids if provided (CRITICAL for RoPE in middle layers)
+                if position_ids is not None:
+                    position_ids_tensor = (
+                        torch.from_numpy(position_ids).long().to(device)
+                    )
+                    inputs["position_ids"] = position_ids_tensor
+                    logger.info(
+                        f"Non-first shard using position_ids: {position_ids_tensor.shape}"
+                    )
+
+                # Add attention_mask if provided
+                if attention_mask is not None:
+                    attention_mask_tensor = (
+                        torch.from_numpy(attention_mask).bool().to(device)
+                    )
+                    inputs["attention_mask"] = attention_mask_tensor
+                    logger.info(
+                        f"Non-first shard using attention_mask: {attention_mask_tensor.shape}"
+                    )
+
+                # CRITICAL: Add cache_position for middle/last shards too
+                # This is needed for the layers to properly update KV cache
+                past_length = _get_cache_seq_length(cache_state)
+                if past_length > 0:
+                    cache_position = torch.arange(
+                        past_length,
+                        past_length + seq_len,
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    inputs["cache_position"] = cache_position
+                    logger.info(
+                        f"🎯 Non-first shard cache_position: {cache_position.tolist()}"
+                    )
+                else:
+                    cache_position = torch.arange(
+                        seq_len, dtype=torch.long, device=device
+                    )
+                    inputs["cache_position"] = cache_position
+                    logger.info(
+                        f"🎯 Non-first shard cache_position: {cache_position.tolist()} (new cache)"
+                    )
+
             # Run inference
             with torch.no_grad():
                 outputs = self.model(**inputs)
 
-                # Update cache
+                # Update cache - CRITICAL for autoregressive generation
+                # Each shard maintains its own KV cache for its layers
                 if (
                     hasattr(outputs, "past_key_values")
                     and outputs.past_key_values is not None
                 ):
                     self.caches[request_id] = outputs.past_key_values
+                    # Log cache size to verify it's growing
+                    # Handle both Cache objects (modern) and tuple caches (legacy)
+                    try:
+                        if hasattr(outputs.past_key_values, "get_seq_length"):
+                            # Modern Cache object (DynamicCache, StaticCache, etc.)
+                            cache_seq_len = outputs.past_key_values.get_seq_length(0)
+                            cache_num_layers = len(outputs.past_key_values)
+                        else:
+                            # Legacy tuple format
+                            cache_seq_len = (
+                                outputs.past_key_values[0][0].shape[2]
+                                if outputs.past_key_values[0] is not None
+                                else 0
+                            )
+                            cache_num_layers = len(outputs.past_key_values)
+                        logger.info(
+                            f"✅ Updated KV cache for request {request_id}: "
+                            f"{cache_num_layers} layers, seq_len={cache_seq_len}"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Could not inspect cache structure: {e}")
+                        logger.info(f"✅ Updated KV cache for request {request_id}")
 
                 # Get output tensor
                 if hasattr(outputs, "logits"):
                     output_tensor = outputs.logits
+                    logger.debug(f"Extracted logits: {output_tensor.shape}")
                 else:
                     # For middle shards, outputs might be hidden states
                     output_tensor = (
@@ -298,6 +518,7 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                         if hasattr(outputs, "last_hidden_state")
                         else outputs[0]
                     )
+                    logger.debug(f"Extracted hidden states: {output_tensor.shape}")
 
                 # Convert BFloat16 to float32 for numpy compatibility
                 if output_tensor.dtype == torch.bfloat16:
@@ -360,8 +581,8 @@ class TransformersShardedInferenceEngine(InferenceEngine):
             config = AutoConfig.from_pretrained(
                 model_id, cache_dir=self.cache_dir, trust_remote_code=True
             )
-            
-            logger.info(f"📋 Model Config:")
+
+            logger.info("📋 Model Config:")
             logger.info(f"   Model type: {config.model_type}")
             logger.info(f"   Hidden size: {config.hidden_size}")
             logger.info(f"   Num layers: {config.num_hidden_layers}")

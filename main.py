@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime
+from pathlib import Path
 
 import typer
 from rich.console import Console
@@ -12,19 +13,34 @@ import iroh
 
 from node import Node
 from llm_service import LLMService, LLMMessageType
-from system_info import collect_and_store_system_info
 
 console = Console()
 app = typer.Typer()
 
+# Create logs directory if it doesn't exist
+logs_dir = Path("logs")
+logs_dir.mkdir(exist_ok=True)
+
+# Generate log filename with timestamp
+log_filename = logs_dir / f"hypercluster_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+# Configure logging to write to both file and console
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(log_filename, encoding='utf-8'),
+        logging.StreamHandler()
+    ]
 )
 
 # Enable DEBUG for critical message routing components
 logging.getLogger("message_handler").setLevel(logging.DEBUG)
 logging.getLogger("node").setLevel(logging.DEBUG)
 logging.getLogger("ring_pipeline").setLevel(logging.DEBUG)
+
+# Log the log file location
+logging.info(f"Logging to file: {log_filename}")
 
 # Global state
 node: Optional[Node] = None
@@ -38,10 +54,12 @@ async def message_handler(message: dict):
     msg_type = message.get("type")
     sender_id = message.get("sender_id")
     payload = message.get("payload", {})
-    
+
     # DIAGNOSTIC: Log ALL incoming messages
     msg_logger = logging.getLogger("message_handler")
-    msg_logger.debug(f"📬 Message received: type={msg_type}, sender={sender_id[:16] if sender_id else 'none'}...")
+    msg_logger.debug(
+        f"📬 Message received: type={msg_type}, sender={sender_id[:16] if sender_id else 'none'}..."
+    )
 
     if msg_type == "text_message":
         console.print(
@@ -50,20 +68,25 @@ async def message_handler(message: dict):
         )
     elif msg_type == "ring_tensor_forward":
         # Handle ring pipeline tensor messages
-        msg_logger.info(f"🔔 Routing ring_tensor_forward to handler")
+        msg_logger.info("🔔 Routing ring_tensor_forward to handler")
         if node and llm_service:
             await node.handle_ring_tensor_message(message, llm_service)
         else:
-            msg_logger.warning(f"⚠️  Cannot handle ring tensor: node={node is not None}, llm_service={llm_service is not None}")
+            msg_logger.warning(
+                f"⚠️  Cannot handle ring tensor: node={node is not None}, llm_service={llm_service is not None}"
+            )
     elif msg_type == "topology_update":
         # Handle topology updates from peers
         if node:
             peer_capabilities_dict = payload.get("capabilities", {})
             from device_capabilities import DeviceCapabilities
+
             peer_capabilities = DeviceCapabilities.from_dict(peer_capabilities_dict)
             node.topology.update_node(sender_id, peer_capabilities)
-            console.print(f"[dim]Updated topology: {sender_id[:16]}... - {peer_capabilities.memory:.1f} GB[/dim]")
-            
+            console.print(
+                f"[dim]Updated topology: {sender_id[:16]}... - {peer_capabilities.memory:.1f} GB[/dim]"
+            )
+
             # Re-initialize ring pipeline if LLM service is running in ring mode
             if llm_service and llm_service.is_running and llm_service.use_ring:
                 asyncio.create_task(llm_service.on_topology_update())
@@ -73,10 +96,10 @@ async def message_handler(message: dict):
     elif msg_type == "llm_message":
         llm_payload = payload
         llm_type = llm_payload.get("llm_type")
-        
+
         if llm_type == LLMMessageType.RESPONSE.value:
-            mode = llm_payload.get('mode', 'unknown')
-            rank = llm_payload.get('rank', '?')
+            mode = llm_payload.get("mode", "unknown")
+            rank = llm_payload.get("rank", "?")
             console.print(
                 f"\n[green]LLM Response from {sender_id} (mode={mode}, rank={rank}):[/green]\n{llm_payload.get('response')}"
             )
@@ -90,7 +113,9 @@ async def message_handler(message: dict):
             await llm_service.handle_llm_message(message)
         elif llm_type == LLMMessageType.QUERY.value:
             # Log if query received but service not running
-            msg_logger.warning(f"Received query but LLM service not running (llm_service={llm_service is not None}, running={llm_service.is_running if llm_service else False})")
+            msg_logger.warning(
+                f"Received query but LLM service not running (llm_service={llm_service is not None}, running={llm_service.is_running if llm_service else False})"
+            )
 
 
 async def run_node(bootstrap_ticket: Optional[str] = None, use_ring: bool = False):
@@ -123,12 +148,15 @@ async def run_node(bootstrap_ticket: Optional[str] = None, use_ring: bool = Fals
             return
 
     llm_service = LLMService(node, use_sharding=True, use_ring=use_ring)
-    
+
     if use_ring:
         console.print("[bold magenta]Ring pipeline mode enabled[/bold magenta]")
 
     console.print(
         f"[bold green]Node started with ID:[/bold green] [yellow]{await node.iroh_node.net().node_id()}[/yellow]"
+    )
+    console.print(
+        f"[dim]📝 Logging to: {log_filename.absolute()}[/dim]"
     )
 
     while True:
@@ -261,23 +289,27 @@ async def handle_command(args: List[str]):
             table.add_column("Node ID", style="cyan")
             table.add_column("Model Name", style="green")
             table.add_column("Status", style="yellow")
-            
+
             # Add local service if running
             if llm_service and llm_service.is_running:
                 my_node_id = str(await node.iroh_node.net().node_id())
-                mode = "ring" if llm_service.use_ring else "sharded" if llm_service.use_sharding else "standard"
-                table.add_row(
-                    f"{my_node_id[:16]}... (me)", 
-                    llm_service.model_name,
-                    f"✓ {mode}"
+                mode = (
+                    "ring"
+                    if llm_service.use_ring
+                    else "sharded"
+                    if llm_service.use_sharding
+                    else "standard"
                 )
-            
+                table.add_row(
+                    f"{my_node_id[:16]}... (me)", llm_service.model_name, f"✓ {mode}"
+                )
+
             # Add discovered services from other nodes
             for node_id, info in llm_nodes.items():
                 table.add_row(
-                    node_id[:16] + "...", 
+                    node_id[:16] + "...",
                     info.get("model_name", "N/A"),
-                    info.get("status", "unknown")
+                    info.get("status", "unknown"),
                 )
             console.print(table)
 
@@ -305,7 +337,7 @@ def start(
     ),
     use_ring: bool = typer.Option(
         False, "--ring", help="Enable ring pipeline mode for distributed inference"
-    )
+    ),
 ):
     """Start the Hypercluster node."""
     mode_str = "with Ring Pipeline" if use_ring else "Standard"
