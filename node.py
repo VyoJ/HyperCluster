@@ -533,33 +533,54 @@ class Node:
             fetch_start = time.time()
             logger.info(f"   📥 Fetching tensor from cache...")
             
-            # Wait for tensor to arrive and be cached
-            # CRITICAL FIX: We now know the exact hash to wait for!
-            max_wait = 15.0  # seconds - increased for network latency across nodes
+            # Fetch tensor: First check cache, then actively fetch via blobs client
+            # CRITICAL: Don't rely on passive CONTENT_READY events - they can be slow!
+            max_wait = 30.0  # seconds - increased timeout
             wait_start = time.time()
             tensor_bytes = None
             
-            # Strategy: Wait for the SPECIFIC hash that was sent
             expected_hash = tensor_hash_str
             expected_size = tensor_size
             
-            logger.info(f"   🎯 Waiting for specific tensor hash: {expected_hash[:16]}...")
+            logger.info(f"   🎯 Looking for tensor hash: {expected_hash[:16]}...")
             
-            while time.time() - wait_start < max_wait:
-                # Check if we have the exact hash in cache
-                if expected_hash in self.tensor_cache:
-                    tensor_bytes = self.tensor_cache[expected_hash]
-                    logger.info(f"   ✅ Found cached tensor: hash={expected_hash[:16]}..., size={len(tensor_bytes)} bytes")
-                    # Clean up cache
-                    del self.tensor_cache[expected_hash]
-                    break
-                
-                # Not cached yet, wait a bit
-                elapsed = time.time() - wait_start
-                # Log every 2 seconds
-                if elapsed > 0 and int(elapsed * 2) % 2 == 0:
-                    logger.debug(f"   ⏳ Waiting for tensor to arrive... (elapsed: {elapsed:.1f}s, cache_entries={len(self.tensor_cache)})")
-                await asyncio.sleep(0.2)
+            # Check cache first (in case CONTENT_READY already fired)
+            if expected_hash in self.tensor_cache:
+                tensor_bytes = self.tensor_cache[expected_hash]
+                logger.info(f"   ✅ Found cached tensor immediately: {len(tensor_bytes)} bytes")
+                del self.tensor_cache[expected_hash]
+            else:
+                # Not in cache - actively fetch it using blobs client
+                logger.info(f"   📡 Not in cache, actively fetching blob...")
+                try:
+                    from iroh import Hash
+                    tensor_hash_obj = Hash.from_string(expected_hash)
+                    
+                    # Try to fetch blob in a loop with retries
+                    retry_count = 0
+                    while time.time() - wait_start < max_wait:
+                        try:
+                            # Active fetch - this will block until blob is available
+                            tensor_bytes = await self.iroh_node.blobs().read_to_bytes(tensor_hash_obj)
+                            logger.info(f"   ✅ Fetched tensor via blobs client: {len(tensor_bytes)} bytes (attempt {retry_count + 1})")
+                            break
+                        except Exception as read_error:
+                            retry_count += 1
+                            # Check cache again (maybe CONTENT_READY fired while we were trying)
+                            if expected_hash in self.tensor_cache:
+                                tensor_bytes = self.tensor_cache[expected_hash]
+                                logger.info(f"   ✅ Found in cache during retry: {len(tensor_bytes)} bytes")
+                                del self.tensor_cache[expected_hash]
+                                break
+                            
+                            elapsed = time.time() - wait_start
+                            if int(elapsed) % 3 == 0:  # Log every 3 seconds
+                                logger.debug(
+                                    f"   ⏳ Fetch attempt {retry_count}, elapsed: {elapsed:.1f}s (error: {type(read_error).__name__})"
+                                )
+                            await asyncio.sleep(0.5)
+                except Exception as e:
+                    logger.error(f"   ❌ Error setting up blob fetch: {e}")
             
             if tensor_bytes is None:
                 logger.error(f"   ❌ Timeout waiting for tensor to arrive (waited {max_wait}s)")
