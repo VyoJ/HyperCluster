@@ -500,6 +500,8 @@ class Node:
             
             # Get tensor key and metadata
             tensor_key_str = payload.get("tensor_key", "")
+            tensor_hash_str = payload.get("tensor_hash", "")  # The actual blob hash!
+            
             if not tensor_key_str:
                 logger.error("   ❌ No tensor key in message")
                 return
@@ -510,6 +512,7 @@ class Node:
             is_final = payload.get("is_final", False)
             
             logger.info(f"   Tensor key: {tensor_key_str[:32]}...")
+            logger.info(f"   Tensor hash: {tensor_hash_str[:16]}...")
             logger.info(f"   Tensor shape: {tensor_shape}, dtype: {tensor_dtype}, size: {tensor_size/1024/1024:.2f}MB")
             logger.info(f"   Is final: {is_final}")
             
@@ -531,43 +534,39 @@ class Node:
             logger.info(f"   📥 Fetching tensor from cache...")
             
             # Wait for tensor to arrive and be cached
-            max_wait = 10.0  # seconds - increased for network latency
+            # CRITICAL FIX: We now know the exact hash to wait for!
+            max_wait = 15.0  # seconds - increased for network latency across nodes
             wait_start = time.time()
             tensor_bytes = None
             
-            # We need to figure out which blob hash to look for
-            # The sender wrote the tensor to document, which triggers CONTENT_READY event
-            # We cache it in tensor_cache by its content hash
-            # BUT we don't know the hash yet! We only know the tensor_key.
-            
-            # Strategy: Wait for ANY new entry in cache that matches the size
+            # Strategy: Wait for the SPECIFIC hash that was sent
+            expected_hash = tensor_hash_str
             expected_size = tensor_size
             
+            logger.info(f"   🎯 Waiting for specific tensor hash: {expected_hash[:16]}...")
+            
             while time.time() - wait_start < max_wait:
-                # Check cache for matching content
-                found_hash = None
-                for cached_hash, cached_content in list(self.tensor_cache.items()):
-                    if len(cached_content) == expected_size:
-                        # Found matching size - assume it's our tensor
-                        found_hash = cached_hash
-                        tensor_bytes = cached_content
-                        logger.info(f"   ✅ Found cached tensor: hash={cached_hash[:16]}..., size={len(tensor_bytes)} bytes")
-                        break
-                
-                if found_hash:
+                # Check if we have the exact hash in cache
+                if expected_hash in self.tensor_cache:
+                    tensor_bytes = self.tensor_cache[expected_hash]
+                    logger.info(f"   ✅ Found cached tensor: hash={expected_hash[:16]}..., size={len(tensor_bytes)} bytes")
                     # Clean up cache
-                    del self.tensor_cache[found_hash]
+                    del self.tensor_cache[expected_hash]
                     break
-                else:
-                    # Not cached yet, wait a bit
-                    if int(time.time() - wait_start) % 2 == 0:  # Log every 2 seconds
-                        logger.debug(f"   ⏳ Waiting for tensor to arrive... (elapsed: {time.time()-wait_start:.1f}s, cache_entries={len(self.tensor_cache)})")
-                    await asyncio.sleep(0.2)
+                
+                # Not cached yet, wait a bit
+                elapsed = time.time() - wait_start
+                # Log every 2 seconds
+                if elapsed > 0 and int(elapsed * 2) % 2 == 0:
+                    logger.debug(f"   ⏳ Waiting for tensor to arrive... (elapsed: {elapsed:.1f}s, cache_entries={len(self.tensor_cache)})")
+                await asyncio.sleep(0.2)
             
             if tensor_bytes is None:
                 logger.error(f"   ❌ Timeout waiting for tensor to arrive (waited {max_wait}s)")
+                logger.error(f"   Expected hash: {expected_hash[:16]}...")
                 logger.error(f"   Expected size: {expected_size} bytes")
-                logger.error(f"   Cache contents: {[(h[:16], len(c)) for h, c in self.tensor_cache.items()]}")
+                logger.error(f"   Cache contents (first 5): {[(h[:16], len(c)) for h, c in list(self.tensor_cache.items())[:5]]}")
+                logger.error(f"   Total cache entries: {len(self.tensor_cache)}")
                 return
             
             fetch_time = time.time() - fetch_start
