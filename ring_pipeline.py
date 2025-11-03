@@ -59,6 +59,7 @@ class InferenceState:
     position_ids: Optional[np.ndarray] = None  # Token positions for RoPE
     attention_mask: Optional[np.ndarray] = None  # Attention mask for tokens
     seq_len: int = 0  # Current sequence length
+    final_result: Optional[np.ndarray] = None  # Final logits when ring completes
 
 
 class RingPipelineCoordinator:
@@ -517,10 +518,13 @@ class RingPipelineCoordinator:
                 f"   ⚠️  Timeout waiting for ring completion! State: layer={state.current_layer}/{shard.n_layers}"
             )
 
+        # Get final result from state (stored by handle_incoming_tensor)
+        final_result = state.final_result if hasattr(state, 'final_result') else result
+        
         # Clean up
         self.active_requests.pop(request_id, None)
 
-        return result
+        return final_result
 
     async def _process_and_forward(
         self, request_id: str, state: InferenceState, shard: Shard
@@ -742,10 +746,11 @@ class RingPipelineCoordinator:
 
             if is_final and self.ring_position and self.ring_position.is_head:
                 # Final result received at head
-                # CRITICAL: Update state to signal completion to waiting loop
+                # CRITICAL: Store result and signal completion to waiting loop
+                state.final_result = tensor_data  # Store the logits
                 state.current_layer = shard.n_layers  # Mark all layers complete
-                logger.info("   ✅ Final result received at HEAD, returning")
-                return tensor_data
+                logger.info("   ✅ Final result received at HEAD, stored in state")
+                return
 
             # Process and forward
             logger.info("   → Processing and forwarding...")
