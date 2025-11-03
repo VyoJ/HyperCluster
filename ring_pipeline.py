@@ -742,6 +742,8 @@ class RingPipelineCoordinator:
 
             if is_final and self.ring_position and self.ring_position.is_head:
                 # Final result received at head
+                # CRITICAL: Update state to signal completion to waiting loop
+                state.current_layer = shard.n_layers  # Mark all layers complete
                 logger.info("   ✅ Final result received at HEAD, returning")
                 return tensor_data
 
