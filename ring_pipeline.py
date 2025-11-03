@@ -579,6 +579,10 @@ class RingPipelineCoordinator:
             # from initialization. We just pass the base shard spec for reference.
             # The actual layer filtering happens in the loaded model.
 
+            # Check if this will be the final layer after processing
+            # CRITICAL: Only apply LM head if we're completing ALL layers
+            will_be_final = (layers_to_process[-1] + 1) >= shard.n_layers
+            
             # Run inference on assigned layers using the already-loaded sharded model
             output_data, new_state = await self.inference_engine.infer_tensor(
                 request_id=request_id,
@@ -587,6 +591,7 @@ class RingPipelineCoordinator:
                 inference_state=state.metadata,
                 position_ids=state.position_ids,  # Pass position_ids to inference
                 attention_mask=state.attention_mask,  # Pass attention_mask to inference
+                is_final=will_be_final,  # Only apply LM head on final layer
             )
 
             compute_time = time.time() - compute_start

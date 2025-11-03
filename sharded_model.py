@@ -228,6 +228,7 @@ class TransformersShard:
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        apply_lm_head: Optional[bool] = None,  # NEW: Override for ring topology
         **kwargs,  # Catch any extra arguments
     ) -> Union[Tuple, CausalLMOutputWithPast, BaseModelOutputWithPast]:
         """
@@ -557,7 +558,13 @@ class TransformersShard:
                     all_self_attns += (layer_outputs.attentions,)
 
         # Apply final processing if this is the last shard
-        is_last = self.shard.is_last_layer()
+        # CRITICAL: In ring mode, apply_lm_head overrides the default shard-based decision
+        # This prevents intermediate nodes from applying LM head when forwarding tensors
+        if apply_lm_head is not None:
+            is_last = apply_lm_head
+            logger.info(f"🔄 Ring mode: apply_lm_head explicitly set to {apply_lm_head}")
+        else:
+            is_last = self.shard.is_last_layer()
 
         # Debug logging
         logger.info(

@@ -216,6 +216,7 @@ class TransformersShardedInferenceEngine(InferenceEngine):
         inference_state: Optional[Dict] = None,
         position_ids: Optional[np.ndarray] = None,
         attention_mask: Optional[np.ndarray] = None,
+        is_final: bool = False,  # NEW: Whether this completes all layers (for LM head)
     ) -> Tuple[np.ndarray, Optional[Dict]]:
         """
         Run inference on input tensor through the assigned shard.
@@ -396,6 +397,7 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                     "past_key_values": cache_state,
                     "use_cache": True,
                     "cache_position": cache_position,
+                    "apply_lm_head": is_final,  # Only apply LM head if this completes all layers
                 }
                 logger.info(
                     f"🔧 Using cache_position={cache_position.tolist()}, letting model compute position_ids and attention_mask internally"
@@ -428,6 +430,7 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                     "inputs_embeds": input_tensor,
                     "past_key_values": cache_state,
                     "use_cache": True,
+                    "apply_lm_head": is_final,  # Only apply LM head if this completes all layers
                 }
 
                 # Add position_ids if provided (CRITICAL for RoPE in middle layers)
