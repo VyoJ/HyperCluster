@@ -49,8 +49,8 @@ class Node:
         ] = {}  # request_id -> (tokens, is_finished)
         self.inference_states: Dict[str, Dict] = {}  # request_id -> inference_state
         
-        # Cache for binary tensor data (size -> hash)
-        self.tensor_cache: Dict[int, str] = {}  # size -> content_hash
+        # Cache for binary tensor data (hash -> content)
+        self.tensor_cache: Dict[str, bytes] = {}  # hash_str -> binary_content
 
     async def start(self):
         """Start the Iroh node."""
@@ -189,9 +189,9 @@ class Node:
                 message_data = json.loads(content.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 # This is binary data (e.g., tensor), not a JSON message
-                # Cache it so we can fetch it later by size
+                # Cache it by HASH (not size, to avoid collisions)
                 logger.debug(f"📦 Caching binary content: {content_size} bytes, hash={hash_str[:16]}...")
-                self.tensor_cache[content_size] = hash_str
+                self.tensor_cache[hash_str] = content
                 return
             
             # DIAGNOSTIC: Log received content with size
@@ -513,39 +513,61 @@ class Node:
             logger.info(f"   Tensor shape: {tensor_shape}, dtype: {tensor_dtype}, size: {tensor_size/1024/1024:.2f}MB")
             logger.info(f"   Is final: {is_final}")
             
+            # Extract position_ids and attention_mask from payload (CRITICAL!)
+            position_ids_list = payload.get("position_ids")
+            attention_mask_list = payload.get("attention_mask")
+            
+            position_ids = np.array(position_ids_list, dtype=np.int64) if position_ids_list is not None else None
+            attention_mask = np.array(attention_mask_list, dtype=np.bool_) if attention_mask_list is not None else None
+            
+            logger.info(f"   Has position_ids: {position_ids is not None}")
+            logger.info(f"   Has attention_mask: {attention_mask is not None}")
+            if position_ids is not None:
+                logger.info(f"   Position_ids shape: {position_ids.shape}, content: {position_ids}")
+            
             # Fetch tensor from cache
-            # We cached the tensor hash when we saw it arrive as binary content
+            # We cached the tensor content when we saw it arrive as binary
             fetch_start = time.time()
             logger.info(f"   📥 Fetching tensor from cache...")
             
             # Wait for tensor to arrive and be cached
-            max_wait = 5.0  # seconds
+            max_wait = 10.0  # seconds - increased for network latency
             wait_start = time.time()
             tensor_bytes = None
             
+            # We need to figure out which blob hash to look for
+            # The sender wrote the tensor to document, which triggers CONTENT_READY event
+            # We cache it in tensor_cache by its content hash
+            # BUT we don't know the hash yet! We only know the tensor_key.
+            
+            # Strategy: Wait for ANY new entry in cache that matches the size
+            expected_size = tensor_size
+            
             while time.time() - wait_start < max_wait:
-                # Check if we have a cached hash for this tensor size
-                if tensor_size in self.tensor_cache:
-                    content_hash_str = self.tensor_cache[tensor_size]
-                    logger.info(f"   ✅ Found cached tensor: hash={content_hash_str[:16]}...")
-                    
-                    # Read it from blobs
-                    from iroh import Hash
-                    content_hash = Hash.from_string(content_hash_str)
-                    tensor_bytes = await self.iroh_node.blobs().read_to_bytes(content_hash)
-                    logger.info(f"   ✅ Tensor fetched: {len(tensor_bytes)} bytes")
-                    
+                # Check cache for matching content
+                found_hash = None
+                for cached_hash, cached_content in list(self.tensor_cache.items()):
+                    if len(cached_content) == expected_size:
+                        # Found matching size - assume it's our tensor
+                        found_hash = cached_hash
+                        tensor_bytes = cached_content
+                        logger.info(f"   ✅ Found cached tensor: hash={cached_hash[:16]}..., size={len(tensor_bytes)} bytes")
+                        break
+                
+                if found_hash:
                     # Clean up cache
-                    del self.tensor_cache[tensor_size]
+                    del self.tensor_cache[found_hash]
                     break
                 else:
                     # Not cached yet, wait a bit
-                    logger.debug(f"   ⏳ Waiting for tensor to arrive... (elapsed: {time.time()-wait_start:.1f}s)")
+                    if int(time.time() - wait_start) % 2 == 0:  # Log every 2 seconds
+                        logger.debug(f"   ⏳ Waiting for tensor to arrive... (elapsed: {time.time()-wait_start:.1f}s, cache_entries={len(self.tensor_cache)})")
                     await asyncio.sleep(0.2)
             
             if tensor_bytes is None:
-                logger.error(f"   ❌ Timeout waiting for tensor to arrive")
-                logger.error(f"   Cache contents: {list(self.tensor_cache.keys())}")
+                logger.error(f"   ❌ Timeout waiting for tensor to arrive (waited {max_wait}s)")
+                logger.error(f"   Expected size: {expected_size} bytes")
+                logger.error(f"   Cache contents: {[(h[:16], len(c)) for h, c in self.tensor_cache.items()]}")
                 return
             
             fetch_time = time.time() - fetch_start
@@ -555,14 +577,16 @@ class Node:
             tensor = np.frombuffer(tensor_bytes, dtype=tensor_dtype).reshape(tensor_shape)
             logger.info(f"   ✅ Tensor reconstructed: shape={tensor.shape}")
             
-            # Pass to ring coordinator
+            # Pass to ring coordinator WITH position_ids and attention_mask (CRITICAL!)
             logger.info(f"   ✅ Passing to ring coordinator...")
             await llm_service.ring_coordinator.handle_incoming_tensor(
                 sender_id=sender_id,
                 request_id=request_id,
                 tensor_data=tensor,
                 shard=llm_service.current_shard,
-                is_final=is_final
+                is_final=is_final,
+                position_ids=position_ids,  # CRITICAL: Pass position info for RoPE
+                attention_mask=attention_mask  # CRITICAL: Pass attention mask
             )
         
         except Exception as e:

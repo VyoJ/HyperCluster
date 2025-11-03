@@ -789,16 +789,19 @@ class RingPipelineCoordinator:
         doc = self.network.documents[doc_id]
         author = await self.network.iroh_node.authors().default()
 
-        # Create unique key for this tensor
-        tensor_key = f"tensor-{request_id}-{time.time()}".encode("utf-8")
+        # Create unique key for this tensor with timestamp and request ID
+        # This helps the receiver identify the exact tensor
+        timestamp_ms = int(time.time() * 1000)
+        tensor_key = f"tensor-{request_id}-{timestamp_ms}".encode("utf-8")
 
         logger.info("   📝 Writing tensor to document as binary entry...")
         write_start = time.time()
-        await doc.set_bytes(author, tensor_key, tensor_bytes)
+        tensor_hash = await doc.set_bytes(author, tensor_key, tensor_bytes)
         write_time = time.time() - write_start
         logger.info(f"   ✅ Tensor written to document in {write_time * 1000:.1f}ms")
+        logger.info(f"   📍 Tensor blob hash: {str(tensor_hash)[:16]}...")
 
-        # Small delay to allow sync
+        # Small delay to allow sync - give Iroh time to propagate the blob
         await asyncio.sleep(0.5)
 
         # Send metadata message with tensor key
@@ -809,9 +812,8 @@ class RingPipelineCoordinator:
             "target_node_id": target_node_id,
             "request_id": request_id,
             "payload": {
-                "tensor_key": tensor_key.decode(
-                    "utf-8"
-                ),  # Key to fetch tensor from document
+                "tensor_key": tensor_key.decode("utf-8"),  # Key to fetch tensor from document
+                "tensor_hash": str(tensor_hash),  # Blob hash for direct lookup
                 "tensor_shape": list(data.shape),
                 "tensor_dtype": str(data.dtype),
                 "tensor_size": len(tensor_bytes),
