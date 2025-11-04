@@ -380,22 +380,17 @@ class RingPipelineCoordinator:
                     logger.debug(f"Could not decode partial output: {e}")
 
             # Check for EOS - support multiple EOS tokens
-            # eos_token_id can be either int or list depending on the tokenizer
             eos_token_id = self.inference_engine.tokenizer.eos_token_id
             
-            # Build set of EOS tokens
-            eos_tokens = set()
-            if isinstance(eos_token_id, (list, tuple)):
-                # eos_token_id is a list of token IDs
-                eos_tokens.update(eos_token_id)
-            elif eos_token_id is not None:
-                # eos_token_id is a single integer
-                eos_tokens.add(eos_token_id)
-            
-            # Some tokenizers also have eos_token_ids attribute (plural)
+            # Some models have multiple EOS tokens (e.g., Qwen has both eos_token_id and special tokens)
+            eos_tokens = {eos_token_id}
             if hasattr(self.inference_engine.tokenizer, 'eos_token_ids'):
-                if isinstance(self.inference_engine.tokenizer.eos_token_ids, (list, tuple)):
-                    eos_tokens.update(self.inference_engine.tokenizer.eos_token_ids)
+                # Handle both list and single int cases
+                additional_eos = self.inference_engine.tokenizer.eos_token_ids
+                if isinstance(additional_eos, (list, tuple)):
+                    eos_tokens.update(additional_eos)
+                else:
+                    eos_tokens.add(additional_eos)
             
             if token_id in eos_tokens:
                 logger.info(
@@ -513,13 +508,13 @@ class RingPipelineCoordinator:
         logger.info("   🎯 Initiating ring from HEAD node...")
         result = await self._process_and_forward(request_id, state, shard)
 
-        # Single node mode: result is returned directly
-        if self.ring_position.world_size == 1:
-            logger.info("   ✅ Single node: returning result directly")
+        # SPECIAL CASE: Single node mode - result is returned directly
+        if self.ring_position and self.ring_position.world_size == 1:
+            logger.info("   ✅ Single node mode: got result directly, no waiting needed")
             self.active_requests.pop(request_id, None)
             return result
 
-        # Multi-node: Wait for completion (result comes back from ring)
+        # Wait for completion (result comes back from ring)
         timeout = 60.0  # seconds - increased for large message sync
         start_time = time.time()
 
@@ -538,7 +533,7 @@ class RingPipelineCoordinator:
                     f"   ⏱️  Still waiting... {elapsed:.0f}s elapsed, current_layer={state.current_layer}/{shard.n_layers}"
                 )
 
-            await asyncio.sleep(0.5)
+            # await asyncio.sleep(0.5)
         else:
             logger.error(
                 f"   ⚠️  Timeout waiting for ring completion! State: layer={state.current_layer}/{shard.n_layers}"
@@ -691,6 +686,11 @@ class RingPipelineCoordinator:
             # Determine what type of data we're sending
             data_type = "LOGITS" if current_data.shape[-1] > 10000 else "HIDDEN STATES"
             logger.info(f"   📊 Data type: {data_type} (shape={current_data.shape})")
+            
+            # SPECIAL CASE: Single node - return logits directly
+            if self.ring_position and self.ring_position.world_size == 1:
+                logger.info("   ✅ Single node mode: Returning logits directly for sampling")
+                return current_data
             
             # Return logits (head node only)
             if self.ring_position and self.ring_position.is_head:
@@ -901,7 +901,7 @@ class RingPipelineCoordinator:
         logger.info(f"   📍 Tensor blob hash: {str(tensor_hash)[:16]}...")
 
         # Small delay to allow sync - give Iroh time to propagate the blob
-        await asyncio.sleep(0.5)
+        # await asyncio.sleep(0.5)
 
         # Send metadata message with tensor key
         # IMPORTANT: Include position_ids and attention_mask like prima.cpp does
