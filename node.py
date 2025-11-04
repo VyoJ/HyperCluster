@@ -578,7 +578,7 @@ class Node:
                                 logger.debug(
                                     f"   ⏳ Fetch attempt {retry_count}, elapsed: {elapsed:.1f}s (error: {type(read_error).__name__})"
                                 )
-                            # await asyncio.sleep(0.1)
+                            await asyncio.sleep(0.1)
                 except Exception as e:
                     logger.error(f"   ❌ Error setting up blob fetch: {e}")
             
