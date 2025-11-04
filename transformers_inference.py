@@ -264,7 +264,7 @@ class TransformersShardedInferenceEngine(InferenceEngine):
             logger.info("=" * 80)
             logger.info(f"Request ID: {request_id}")
             logger.info(
-                f"My shard: {self.shard.layer_start}-{self.shard.layer_end} ({self.shard.layer_end - self.shard.layer_start + 1} layers)"
+                f"My shard: {self.shard.start_layer}-{self.shard.end_layer} ({self.shard.end_layer - self.shard.start_layer + 1} layers)"
             )
             logger.info(f"Total model layers: {self.shard.n_layers}")
 
@@ -289,7 +289,7 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                         logger.info(f"   ... and {num_cached_layers - 3} more layers")
 
                     # 🚨 CRITICAL CHECK: Does cache have ALL model layers or just my shard's layers?
-                    expected_layers = self.shard.layer_end - self.shard.layer_start + 1
+                    expected_layers = self.shard.end_layer - self.shard.start_layer + 1
                     if (
                         num_cached_layers != expected_layers
                         and num_cached_layers != self.shard.n_layers
@@ -566,12 +566,12 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                             logger.info(f"Number of layers cached: {cache_num_layers}")
                             logger.info(f"Sequence length: {cache_seq_len}")
                             logger.info(
-                                f"My shard layers: {self.shard.layer_start}-{self.shard.layer_end}"
+                                f"My shard layers: {self.shard.start_layer}-{self.shard.end_layer}"
                             )
 
                             # 🚨 CRITICAL: Check if cache matches shard
                             expected_shard_layers = (
-                                self.shard.layer_end - self.shard.layer_start + 1
+                                self.shard.end_layer - self.shard.start_layer + 1
                             )
                             if cache_num_layers == expected_shard_layers:
                                 logger.info(
