@@ -551,7 +551,7 @@ class Node:
                 del self.tensor_cache[expected_hash]
             else:
                 # Not in cache - actively fetch it using blobs client
-                logger.info(f"   📡 Not in cache, actively fetching blob...")
+                logger.info("   📡 Not in cache, actively fetching blob...")
                 try:
                     from iroh import Hash
                     tensor_hash_obj = Hash.from_string(expected_hash)
@@ -578,7 +578,7 @@ class Node:
                                 logger.debug(
                                     f"   ⏳ Fetch attempt {retry_count}, elapsed: {elapsed:.1f}s (error: {type(read_error).__name__})"
                                 )
-                            await asyncio.sleep(0.1)
+                            # await asyncio.sleep(0.1)
                 except Exception as e:
                     logger.error(f"   ❌ Error setting up blob fetch: {e}")
             
