@@ -60,7 +60,9 @@ class InferenceState:
     attention_mask: Optional[np.ndarray] = None  # Attention mask for tokens
     seq_len: int = 0  # Current sequence length
     final_result: Optional[np.ndarray] = None  # Final logits when ring completes
-    generation_step: int = 0  # Which token we're generating (0=prompt, 1+=autoregressive)
+    generation_step: int = (
+        0  # Which token we're generating (0=prompt, 1+=autoregressive)
+    )
     last_processed_step: int = -1  # Last step this node processed (to detect new steps)
 
 
@@ -319,6 +321,22 @@ class RingPipelineCoordinator:
             logger.info(f"🔄 GENERATION STEP {step + 1}/{max_tokens}")
             logger.info(f"   Tokens generated so far: {len(generated_tokens)}")
 
+            # 🐛 DEBUG: Check cache state before generation step
+            logger.info("")
+            logger.info("🔍 PRE-STEP CACHE CHECK")
+            logger.info(f"   Request ID: {request_id}")
+            if request_id in self.inference_engine.caches:
+                cache = self.inference_engine.caches[request_id]
+                if hasattr(cache, "key_cache"):
+                    logger.info(f"   ✅ Cache exists: {len(cache.key_cache)} layers")
+                    if len(cache.key_cache) > 0 and cache.key_cache[0] is not None:
+                        logger.info(f"   Cache seq_len: {cache.key_cache[0].shape[2]}")
+                else:
+                    logger.info(f"   ✅ Cache exists (tuple): {len(cache)} layers")
+            else:
+                logger.info("   ❌ No cache found")
+            logger.info("")
+
             step_start = time.time()
 
             # Process through ring pipeline
@@ -381,17 +399,17 @@ class RingPipelineCoordinator:
 
             # Check for EOS - support multiple EOS tokens
             eos_token_id = self.inference_engine.tokenizer.eos_token_id
-            
+
             # Some models have multiple EOS tokens (e.g., Qwen has both eos_token_id and special tokens)
             eos_tokens = {eos_token_id}
-            if hasattr(self.inference_engine.tokenizer, 'eos_token_ids'):
+            if hasattr(self.inference_engine.tokenizer, "eos_token_ids"):
                 # Handle both list and single int cases
                 additional_eos = self.inference_engine.tokenizer.eos_token_ids
                 if isinstance(additional_eos, (list, tuple)):
                     eos_tokens.update(additional_eos)
                 else:
                     eos_tokens.add(additional_eos)
-            
+
             if token_id in eos_tokens:
                 logger.info(
                     f"   🛑 EOS token ({token_id}) detected, stopping generation"
@@ -510,7 +528,9 @@ class RingPipelineCoordinator:
 
         # SPECIAL CASE: Single node mode - result is returned directly
         if self.ring_position and self.ring_position.world_size == 1:
-            logger.info("   ✅ Single node mode: got result directly, no waiting needed")
+            logger.info(
+                "   ✅ Single node mode: got result directly, no waiting needed"
+            )
             self.active_requests.pop(request_id, None)
             return result
 
@@ -540,8 +560,8 @@ class RingPipelineCoordinator:
             )
 
         # Get final result from state (stored by handle_incoming_tensor)
-        final_result = state.final_result if hasattr(state, 'final_result') else result
-        
+        final_result = state.final_result if hasattr(state, "final_result") else result
+
         # Clean up
         self.active_requests.pop(request_id, None)
 
@@ -606,7 +626,7 @@ class RingPipelineCoordinator:
 
             # CRITICAL FIX: Determine if we should apply LM head
             # LM head should ONLY be applied by the LAST node in the ring that completes all layers
-            # 
+            #
             # Logic for multi-node ring (scalable to N nodes):
             # 1. Check if processing our layers will complete ALL model layers
             # 2. If yes, check if we're the last node in the ring (highest rank with layers)
@@ -616,26 +636,30 @@ class RingPipelineCoordinator:
             #   Node 0 (rank 0): layers 0-9   → will_be_final=False (9+1=10 < 28)
             #   Node 1 (rank 1): layers 10-18 → will_be_final=False (18+1=19 < 28)
             #   Node 2 (rank 2): layers 19-27 → will_be_final=True (27+1=28 >= 28) ✓ Apply LM head
-            
+
             will_complete_all_layers = (layers_to_process[-1] + 1) >= shard.n_layers
-            
+
             # Additionally check: are we the last node in the ring?
             # This is important because if a node's layer window doesn't perfectly align,
             # we need to ensure only the actual last processor applies the head
             is_last_node_in_ring = (
-                self.ring_position 
+                self.ring_position
                 and self.layer_window
                 and self.layer_window.layer_end == shard.n_layers - 1
             )
-            
+
             # Apply LM head ONLY if we're completing all layers AND we're the designated last node
             apply_lm_head = will_complete_all_layers and is_last_node_in_ring
-            
-            logger.info(f"   🎯 LM head decision:")
-            logger.info(f"      - Will complete all layers: {will_complete_all_layers} (processing up to layer {layers_to_process[-1]})")
-            logger.info(f"      - Is last node in ring: {is_last_node_in_ring} (layer_end={self.layer_window.layer_end if self.layer_window else '?'}, total={shard.n_layers})")
+
+            logger.info("   🎯 LM head decision:")
+            logger.info(
+                f"      - Will complete all layers: {will_complete_all_layers} (processing up to layer {layers_to_process[-1]})"
+            )
+            logger.info(
+                f"      - Is last node in ring: {is_last_node_in_ring} (layer_end={self.layer_window.layer_end if self.layer_window else '?'}, total={shard.n_layers})"
+            )
             logger.info(f"      - Apply LM head: {apply_lm_head}")
-            
+
             # Run inference on assigned layers using the already-loaded sharded model
             output_data, new_state = await self.inference_engine.infer_tensor(
                 request_id=request_id,
@@ -663,18 +687,22 @@ class RingPipelineCoordinator:
                 f"   Updated global progress: {state.current_layer}/{shard.n_layers}"
             )
             logger.info(f"   Layers remaining: {shard.n_layers - state.current_layer}")
-            
+
             # Log output type for debugging
             if output_data.shape[-1] == shard.n_layers:  # Assuming vocab size check
-                logger.info(f"   📊 Output type: LOGITS (vocab_size={output_data.shape[-1]})")
+                logger.info(
+                    f"   📊 Output type: LOGITS (vocab_size={output_data.shape[-1]})"
+                )
             else:
-                logger.info(f"   📊 Output type: HIDDEN STATES (hidden_size={output_data.shape[-1]})")
+                logger.info(
+                    f"   📊 Output type: HIDDEN STATES (hidden_size={output_data.shape[-1]})"
+                )
         else:
             logger.debug(
                 f"   No layers to process in current chunk (current_layer={state.current_layer}, my_window={self.layer_window.layer_start}-{self.layer_window.layer_end})"
             )
             logger.warning(
-                f"   ⚠️  WARNING: Received tensor but no layers to process! This may indicate a state synchronization issue."
+                "   ⚠️  WARNING: Received tensor but no layers to process! This may indicate a state synchronization issue."
             )
 
         # Check if this is the last layer
@@ -682,16 +710,18 @@ class RingPipelineCoordinator:
 
         if is_final_layer:
             logger.info("   🏁 Final layer reached!")
-            
+
             # Determine what type of data we're sending
             data_type = "LOGITS" if current_data.shape[-1] > 10000 else "HIDDEN STATES"
             logger.info(f"   📊 Data type: {data_type} (shape={current_data.shape})")
-            
+
             # SPECIAL CASE: Single node - return logits directly
             if self.ring_position and self.ring_position.world_size == 1:
-                logger.info("   ✅ Single node mode: Returning logits directly for sampling")
+                logger.info(
+                    "   ✅ Single node mode: Returning logits directly for sampling"
+                )
                 return current_data
-            
+
             # Return logits (head node only)
             if self.ring_position and self.ring_position.is_head:
                 logger.info("   ✅ HEAD node: Returning logits for sampling")
@@ -769,11 +799,52 @@ class RingPipelineCoordinator:
             # Restore or create state
             if request_id in self.active_requests:
                 state = self.active_requests[request_id]
-                logger.info(f"   Restored existing state (layer {state.current_layer}, step {state.generation_step})")
+                logger.info(
+                    f"   Restored existing state (layer {state.current_layer}, step {state.generation_step})"
+                )
+
+                # 🐛 DEBUG: Check if we have cache for this request
+                logger.info("")
+                logger.info("🔍 WORKER NODE CACHE CHECK")
+                if request_id in self.inference_engine.caches:
+                    cache = self.inference_engine.caches[request_id]
+                    if hasattr(cache, "key_cache"):
+                        logger.info(
+                            f"   ✅ Cache exists: {len(cache.key_cache)} layers"
+                        )
+                        if len(cache.key_cache) > 0 and cache.key_cache[0] is not None:
+                            logger.info(
+                                f"   Cache seq_len: {cache.key_cache[0].shape[2]}"
+                            )
+                    else:
+                        logger.info(f"   ✅ Cache exists (tuple): {len(cache)} layers")
+                else:
+                    logger.warning("   ⚠️  NO CACHE found on worker node!")
+                    logger.warning(
+                        "   This is UNEXPECTED for step > 0 in autoregressive generation!"
+                    )
+                    logger.warning(
+                        "   Worker nodes should maintain cache from previous steps!"
+                    )
+                logger.info("")
             else:
                 # For new state, start from the beginning of our layer window
                 # This ensures we don't try to process layers that were already handled by previous nodes
                 start_layer = self.layer_window.layer_start if self.layer_window else 0
+
+                logger.info("   Creating NEW state for request (first time seeing it)")
+
+                # 🐛 DEBUG: Check if we should have cache
+                logger.info("")
+                logger.info("🔍 WORKER NODE - NEW REQUEST")
+                if request_id in self.inference_engine.caches:
+                    logger.warning(
+                        "   ⚠️  UNEXPECTED: Cache exists but no active_request state!"
+                    )
+                    logger.warning("   This might indicate state management issue")
+                else:
+                    logger.info("   ✅ No cache (expected for first time)")
+                logger.info("")
 
                 state = InferenceState(
                     request_id=request_id,
@@ -813,7 +884,9 @@ class RingPipelineCoordinator:
                 logger.info(
                     f"   🔄 NEW GENERATION STEP DETECTED (current_layer={state.current_layer} >= {shard.n_layers})"
                 )
-                logger.info(f"   🔄 Resetting current_layer: {state.current_layer} → {start_layer}")
+                logger.info(
+                    f"   🔄 Resetting current_layer: {state.current_layer} → {start_layer}"
+                )
                 state.current_layer = start_layer
                 state.generation_step += 1
                 logger.info(f"   🔄 Generation step: {state.generation_step}")
@@ -911,7 +984,9 @@ class RingPipelineCoordinator:
             "target_node_id": target_node_id,
             "request_id": request_id,
             "payload": {
-                "tensor_key": tensor_key.decode("utf-8"),  # Key to fetch tensor from document
+                "tensor_key": tensor_key.decode(
+                    "utf-8"
+                ),  # Key to fetch tensor from document
                 "tensor_hash": str(tensor_hash),  # Blob hash for direct lookup
                 "tensor_shape": list(data.shape),
                 "tensor_dtype": str(data.dtype),
