@@ -96,17 +96,31 @@ class TransformersShardedInferenceEngine(InferenceEngine):
         )
 
     async def encode(self, shard: Shard, prompt: str) -> np.ndarray:
-        """Encode text prompt to token IDs."""
+        """Encode text prompt to token IDs using chat template."""
         await self.ensure_shard(shard)
 
         def _encode():
-            # Use simple encoding - chat template with add_generation_prompt=True
-            # adds trailing newlines that cause the model to generate only newlines
-            tokens = self.tokenizer.encode(prompt, add_special_tokens=True)
+            # Use chat template for proper formatting with control tokens
+            # This ensures the model receives proper start/end tokens and knows when to stop
+            messages = [
+                {"role": "user", "content": prompt}
+            ]
+            
+            # Apply chat template with add_generation_prompt=True
+            # This adds the proper assistant response prompt tokens
+            formatted_prompt = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            
+            # Now tokenize the formatted prompt
+            tokens = self.tokenizer.encode(formatted_prompt, add_special_tokens=False)
 
             logger.info(
                 f"Encoded '{prompt[:50]}...' to {len(tokens)} tokens: {tokens[:10]}..."
             )
+            logger.info(f"Formatted prompt: {formatted_prompt[:100]}...")
             return np.array(tokens, dtype=np.int64)
 
         return await self._run_in_tokenizer_thread(_encode)

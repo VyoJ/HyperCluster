@@ -379,11 +379,22 @@ class RingPipelineCoordinator:
                 except Exception as e:
                     logger.debug(f"Could not decode partial output: {e}")
 
-            # Check for EOS
+            # Check for EOS - support multiple EOS tokens
             eos_token_id = self.inference_engine.tokenizer.eos_token_id
-            if token_id == eos_token_id:
+            
+            # Some models have multiple EOS tokens (e.g., Qwen has both eos_token_id and special tokens)
+            eos_tokens = {eos_token_id}
+            if hasattr(self.inference_engine.tokenizer, 'eos_token_ids'):
+                # Handle both list and single int cases
+                additional_eos = self.inference_engine.tokenizer.eos_token_ids
+                if isinstance(additional_eos, (list, tuple)):
+                    eos_tokens.update(additional_eos)
+                else:
+                    eos_tokens.add(additional_eos)
+            
+            if token_id in eos_tokens:
                 logger.info(
-                    f"   🛑 EOS token ({eos_token_id}) detected, stopping generation"
+                    f"   🛑 EOS token ({token_id}) detected, stopping generation"
                 )
                 break
 
@@ -496,6 +507,12 @@ class RingPipelineCoordinator:
         # Head node starts the ring
         logger.info("   🎯 Initiating ring from HEAD node...")
         result = await self._process_and_forward(request_id, state, shard)
+
+        # SPECIAL CASE: Single node mode - result is returned directly
+        if self.ring_position and self.ring_position.world_size == 1:
+            logger.info("   ✅ Single node mode: got result directly, no waiting needed")
+            self.active_requests.pop(request_id, None)
+            return result
 
         # Wait for completion (result comes back from ring)
         timeout = 60.0  # seconds - increased for large message sync
@@ -669,6 +686,11 @@ class RingPipelineCoordinator:
             # Determine what type of data we're sending
             data_type = "LOGITS" if current_data.shape[-1] > 10000 else "HIDDEN STATES"
             logger.info(f"   📊 Data type: {data_type} (shape={current_data.shape})")
+            
+            # SPECIAL CASE: Single node - return logits directly
+            if self.ring_position and self.ring_position.world_size == 1:
+                logger.info("   ✅ Single node mode: Returning logits directly for sampling")
+                return current_data
             
             # Return logits (head node only)
             if self.ring_position and self.ring_position.is_head:

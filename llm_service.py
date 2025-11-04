@@ -60,7 +60,7 @@ class LLMService:
         self.is_bitnet = "bitnet" in model_name.lower()
 
         # Distributed inference state
-        self.max_generate_tokens = 256
+        self.max_generate_tokens = 50
         self.default_sample_temperature = 0.7
 
     async def start(
