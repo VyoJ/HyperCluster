@@ -329,8 +329,25 @@ class RingPipelineCoordinator:
                 cache = self.inference_engine.caches[request_id]
                 if hasattr(cache, "key_cache"):
                     logger.info(f"   ✅ Cache exists: {len(cache.key_cache)} layers")
-                    if len(cache.key_cache) > 0 and cache.key_cache[0] is not None:
-                        logger.info(f"   Cache seq_len: {cache.key_cache[0].shape[2]}")
+                    # Check the first layer this shard owns, not layer 0
+                    first_shard_layer = self.layer_window.layer_start
+                    if (
+                        len(cache.key_cache) > first_shard_layer
+                        and cache.key_cache[first_shard_layer] is not None
+                    ):
+                        # Check if tensor has expected dimensions before accessing shape[2]
+                        if cache.key_cache[first_shard_layer].ndim >= 3:
+                            logger.info(
+                                f"   Cache seq_len (layer {first_shard_layer}): {cache.key_cache[first_shard_layer].shape[2]}"
+                            )
+                        else:
+                            logger.info(
+                                f"   Cache tensor shape (layer {first_shard_layer}): {cache.key_cache[first_shard_layer].shape} (empty/invalid)"
+                            )
+                    else:
+                        logger.info(
+                            f"   ⚠️  No cache data for shard layers (checking layer {first_shard_layer})"
+                        )
                 else:
                     logger.info(f"   ✅ Cache exists (tuple): {len(cache)} layers")
             else:
@@ -812,9 +829,24 @@ class RingPipelineCoordinator:
                         logger.info(
                             f"   ✅ Cache exists: {len(cache.key_cache)} layers"
                         )
-                        if len(cache.key_cache) > 0 and cache.key_cache[0] is not None:
+                        # Check the first layer this shard owns, not layer 0
+                        first_shard_layer = self.layer_window.layer_start
+                        if (
+                            len(cache.key_cache) > first_shard_layer
+                            and cache.key_cache[first_shard_layer] is not None
+                        ):
+                            # Check if tensor has expected dimensions before accessing shape[2]
+                            if cache.key_cache[first_shard_layer].ndim >= 3:
+                                logger.info(
+                                    f"   Cache seq_len (layer {first_shard_layer}): {cache.key_cache[first_shard_layer].shape[2]}"
+                                )
+                            else:
+                                logger.info(
+                                    f"   Cache tensor shape (layer {first_shard_layer}): {cache.key_cache[first_shard_layer].shape} (empty/invalid)"
+                                )
+                        else:
                             logger.info(
-                                f"   Cache seq_len: {cache.key_cache[0].shape[2]}"
+                                f"   ⚠️  No cache data for shard layers (checking layer {first_shard_layer})"
                             )
                     else:
                         logger.info(f"   ✅ Cache exists (tuple): {len(cache)} layers")
