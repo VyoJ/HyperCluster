@@ -553,7 +553,7 @@ class RingPipelineCoordinator:
                     f"   ⏱️  Still waiting... {elapsed:.0f}s elapsed, current_layer={state.current_layer}/{shard.n_layers}"
                 )
 
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.1)
         else:
             logger.error(
                 f"   ⚠️  Timeout waiting for ring completion! State: layer={state.current_layer}/{shard.n_layers}"
@@ -974,7 +974,7 @@ class RingPipelineCoordinator:
         logger.info(f"   📍 Tensor blob hash: {str(tensor_hash)[:16]}...")
 
         # Small delay to allow sync - give Iroh time to propagate the blob
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.1)
 
         # Send metadata message with tensor key
         # IMPORTANT: Include position_ids and attention_mask like prima.cpp does
