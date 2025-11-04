@@ -60,6 +60,8 @@ class InferenceState:
     attention_mask: Optional[np.ndarray] = None  # Attention mask for tokens
     seq_len: int = 0  # Current sequence length
     final_result: Optional[np.ndarray] = None  # Final logits when ring completes
+    generation_step: int = 0  # Which token we're generating (0=prompt, 1+=autoregressive)
+    last_processed_step: int = -1  # Last step this node processed (to detect new steps)
 
 
 class RingPipelineCoordinator:
@@ -266,7 +268,7 @@ class RingPipelineCoordinator:
         return cycles
 
     async def start_inference(
-        self, request_id: str, prompt: str, shard: Shard, max_tokens: int = 256
+        self, request_id: str, prompt: str, shard: Shard, max_tokens: int = 50
     ) -> List[int]:
         """
         Start ring pipeline inference (head node only).
@@ -485,6 +487,8 @@ class RingPipelineCoordinator:
             position_ids=position_ids,  # Store position_ids
             attention_mask=attention_mask,  # Store attention_mask
             seq_len=seq_len,
+            generation_step=0,  # First step (prompt processing)
+            last_processed_step=-1,  # Not processed yet
         )
 
         self.active_requests[request_id] = state
@@ -583,9 +587,37 @@ class RingPipelineCoordinator:
             # from initialization. We just pass the base shard spec for reference.
             # The actual layer filtering happens in the loaded model.
 
-            # Check if this will be the final layer after processing
-            # CRITICAL: Only apply LM head if we're completing ALL layers
-            will_be_final = (layers_to_process[-1] + 1) >= shard.n_layers
+            # CRITICAL FIX: Determine if we should apply LM head
+            # LM head should ONLY be applied by the LAST node in the ring that completes all layers
+            # 
+            # Logic for multi-node ring (scalable to N nodes):
+            # 1. Check if processing our layers will complete ALL model layers
+            # 2. If yes, check if we're the last node in the ring (highest rank with layers)
+            # 3. Only the last node with the highest layer range applies LM head
+            #
+            # Example with 3 nodes (28 layers):
+            #   Node 0 (rank 0): layers 0-9   → will_be_final=False (9+1=10 < 28)
+            #   Node 1 (rank 1): layers 10-18 → will_be_final=False (18+1=19 < 28)
+            #   Node 2 (rank 2): layers 19-27 → will_be_final=True (27+1=28 >= 28) ✓ Apply LM head
+            
+            will_complete_all_layers = (layers_to_process[-1] + 1) >= shard.n_layers
+            
+            # Additionally check: are we the last node in the ring?
+            # This is important because if a node's layer window doesn't perfectly align,
+            # we need to ensure only the actual last processor applies the head
+            is_last_node_in_ring = (
+                self.ring_position 
+                and self.layer_window
+                and self.layer_window.layer_end == shard.n_layers - 1
+            )
+            
+            # Apply LM head ONLY if we're completing all layers AND we're the designated last node
+            apply_lm_head = will_complete_all_layers and is_last_node_in_ring
+            
+            logger.info(f"   🎯 LM head decision:")
+            logger.info(f"      - Will complete all layers: {will_complete_all_layers} (processing up to layer {layers_to_process[-1]})")
+            logger.info(f"      - Is last node in ring: {is_last_node_in_ring} (layer_end={self.layer_window.layer_end if self.layer_window else '?'}, total={shard.n_layers})")
+            logger.info(f"      - Apply LM head: {apply_lm_head}")
             
             # Run inference on assigned layers using the already-loaded sharded model
             output_data, new_state = await self.inference_engine.infer_tensor(
@@ -595,7 +627,7 @@ class RingPipelineCoordinator:
                 inference_state=state.metadata,
                 position_ids=state.position_ids,  # Pass position_ids to inference
                 attention_mask=state.attention_mask,  # Pass attention_mask to inference
-                is_final=will_be_final,  # Only apply LM head on final layer
+                is_final=apply_lm_head,  # Only apply LM head if we're the last node completing all layers
             )
 
             compute_time = time.time() - compute_start
@@ -614,9 +646,18 @@ class RingPipelineCoordinator:
                 f"   Updated global progress: {state.current_layer}/{shard.n_layers}"
             )
             logger.info(f"   Layers remaining: {shard.n_layers - state.current_layer}")
+            
+            # Log output type for debugging
+            if output_data.shape[-1] == shard.n_layers:  # Assuming vocab size check
+                logger.info(f"   📊 Output type: LOGITS (vocab_size={output_data.shape[-1]})")
+            else:
+                logger.info(f"   📊 Output type: HIDDEN STATES (hidden_size={output_data.shape[-1]})")
         else:
             logger.debug(
                 f"   No layers to process in current chunk (current_layer={state.current_layer}, my_window={self.layer_window.layer_start}-{self.layer_window.layer_end})"
+            )
+            logger.warning(
+                f"   ⚠️  WARNING: Received tensor but no layers to process! This may indicate a state synchronization issue."
             )
 
         # Check if this is the last layer
@@ -624,13 +665,18 @@ class RingPipelineCoordinator:
 
         if is_final_layer:
             logger.info("   🏁 Final layer reached!")
+            
+            # Determine what type of data we're sending
+            data_type = "LOGITS" if current_data.shape[-1] > 10000 else "HIDDEN STATES"
+            logger.info(f"   📊 Data type: {data_type} (shape={current_data.shape})")
+            
             # Return logits (head node only)
             if self.ring_position and self.ring_position.is_head:
                 logger.info("   ✅ HEAD node: Returning logits for sampling")
                 return current_data
             else:
                 # Send back to head
-                logger.info("   📤 Worker node: Sending final result to HEAD")
+                logger.info(f"   📤 Worker node: Sending {data_type} back to HEAD")
                 await self._send_to_node(
                     target_node_id=self._find_head_node_id(),
                     data=current_data,
@@ -701,7 +747,7 @@ class RingPipelineCoordinator:
             # Restore or create state
             if request_id in self.active_requests:
                 state = self.active_requests[request_id]
-                logger.info(f"   Restored existing state (layer {state.current_layer})")
+                logger.info(f"   Restored existing state (layer {state.current_layer}, step {state.generation_step})")
             else:
                 # For new state, start from the beginning of our layer window
                 # This ensures we don't try to process layers that were already handled by previous nodes
@@ -718,6 +764,8 @@ class RingPipelineCoordinator:
                     seq_len=tensor_data.shape[1]
                     if tensor_data.ndim >= 2
                     else tensor_data.shape[0],
+                    generation_step=0,
+                    last_processed_step=-1,
                 )
                 self.active_requests[request_id] = state
                 logger.info(f"   Created new state starting at layer {start_layer}")
@@ -729,13 +777,30 @@ class RingPipelineCoordinator:
             if attention_mask is not None:
                 state.attention_mask = attention_mask
 
-            # CRITICAL FIX: If current_layer is before our window, skip to our window start
-            # This handles the case where a previous node already processed its layers
-            # and we're receiving data mid-stream
-            if (
+            # CRITICAL FIX: Detect if this is a new generation step
+            # In autoregressive generation, each new token starts a fresh pass through the ring
+            # We detect this by checking if:
+            # 1. current_layer >= total layers (previous step completed all layers)
+            # 2. We're receiving new data (tensor shape indicates new input)
+            #
+            # When detected, RESET current_layer to our window start so we process our layers again
+            if state.current_layer >= shard.n_layers:
+                # Previous generation step completed all layers
+                # This is a NEW generation step - reset to process our layers again
+                start_layer = self.layer_window.layer_start if self.layer_window else 0
+                logger.info(
+                    f"   🔄 NEW GENERATION STEP DETECTED (current_layer={state.current_layer} >= {shard.n_layers})"
+                )
+                logger.info(f"   🔄 Resetting current_layer: {state.current_layer} → {start_layer}")
+                state.current_layer = start_layer
+                state.generation_step += 1
+                logger.info(f"   🔄 Generation step: {state.generation_step}")
+            elif (
                 self.layer_window
                 and state.current_layer < self.layer_window.layer_start
             ):
+                # Current layer is before our window - advance to our window start
+                # This handles mid-stream joins or irregular layer distributions
                 logger.info(
                     f"   ⚠️  current_layer ({state.current_layer}) < our window start ({self.layer_window.layer_start})"
                 )
