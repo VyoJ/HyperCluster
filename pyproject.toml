@@ -14,4 +14,6 @@ dependencies = [
     "transformers>=4.41.2",
     "torch>=2.3.1",
     "accelerate>=1.10.1",
+    "maturin>=1.9.6",
+    "setuptools>=80.9.0",
 ]
