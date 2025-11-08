@@ -686,12 +686,9 @@ class TransformersShardedInferenceEngine(InferenceEngine):
         Note: In ring pipeline mode, each node loads its assigned shard once.
         Subsequent calls with different shard specs (e.g., base_shard vs current_shard)
         for the SAME model_id will reuse the already-loaded shard to avoid reloading.
-        
-        CRITICAL FIX: If the layer range changes (topology update), we need to
-        re-wrap the model with the new layer range.
         """
         async with self._shard_lock:
-            # Quick check if already loaded with exact same shard
+            # Quick check if already loaded
             if self.shard == shard:
                 return
 
@@ -699,44 +696,22 @@ class TransformersShardedInferenceEngine(InferenceEngine):
             # In future, this will download from a shard downloader
             model_id = shard.model_id
 
-            # Check if we need to reload or just re-wrap
+            # Only reload if model_id changes, NOT if just layer range changes
+            # This allows ring pipeline to pass base_shard for coordination
+            # while keeping the node's assigned shard loaded
             if self.shard is None or self.shard.model_id != shard.model_id:
-                # Different model - full reload
                 await self._load_shard(model_id, shard)
                 self.shard = shard
 
                 # Clear caches and session when switching models
                 self.caches.clear()
                 self.session.clear()
-            elif (self.shard.start_layer != shard.start_layer or 
-                  self.shard.end_layer != shard.end_layer):
-                # Same model but different layer range - re-wrap the model
-                # This happens during topology updates when layer assignments change
-                logger.info("")
-                logger.info("=" * 80)
-                logger.info("🔄 LAYER RANGE CHANGED - RE-WRAPPING MODEL")
-                logger.info("=" * 80)
-                logger.info(f"   Previous shard: {self.shard}")
-                logger.info(f"   New shard:      {shard}")
-                logger.info(f"   Layer change:   [{self.shard.start_layer}-{self.shard.end_layer}] → [{shard.start_layer}-{shard.end_layer}]")
-                logger.info("=" * 80)
-                
-                # Re-wrap the already-loaded model with new layer range
-                self.model = self._wrap_model_in_shard(self.model.base_model, shard)
-                self.shard = shard
-                
-                # CRITICAL: Clear caches when layer range changes
-                # Old caches are for different layers and will cause corruption
-                logger.info("🗑️  Clearing all KV caches (layer assignment changed)")
-                self.caches.clear()
-                self.session.clear()
-                
-                logger.info("✅ Model re-wrapped with new layer range")
-                logger.info("")
             else:
-                # Same model, same layer range - this shouldn't happen but handle it
+                # Same model, different layer spec - don't reload
+                # This happens when ring pipeline passes base_shard
+                # but node already has current_shard loaded
                 logger.debug(
-                    f"Shard spec changed but same model_id and layers, keeping loaded shard: "
+                    f"Shard spec changed but same model_id, keeping loaded shard: "
                     f"loaded={self.shard}, requested={shard}"
                 )
 

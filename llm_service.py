@@ -772,55 +772,12 @@ class LLMService:
         my_node_id = str(await self.network.iroh_node.net().node_id())
 
         try:
-            # Store old layer assignment for comparison
-            old_layer_window = None
-            if self.ring_coordinator.layer_window:
-                old_layer_window = (
-                    self.ring_coordinator.layer_window.layer_start,
-                    self.ring_coordinator.layer_window.layer_end
-                )
-            
-            # Re-initialize ring with new topology
             await self.ring_coordinator.initialize_ring(
                 topology_nodes=topology_nodes,
                 my_node_id=my_node_id,
                 model_total_layers=self.base_shard.n_layers,  # Use base_shard for full model spec
             )
             logger.info("Ring re-initialized successfully")
-            
-            # CRITICAL FIX: Check if layer assignment changed
-            new_layer_window = None
-            if self.ring_coordinator.layer_window:
-                new_layer_window = (
-                    self.ring_coordinator.layer_window.layer_start,
-                    self.ring_coordinator.layer_window.layer_end
-                )
-            
-            if old_layer_window != new_layer_window:
-                logger.info("")
-                logger.info("⚠️  LAYER ASSIGNMENT CHANGED - RELOADING MODEL SHARD")
-                logger.info(f"   Old layers: {old_layer_window}")
-                logger.info(f"   New layers: {new_layer_window}")
-                
-                # Get new shard assignment based on updated topology
-                new_shard = await self.network.get_current_shard(self.base_shard)
-                
-                if new_shard:
-                    logger.info(f"   New shard: {new_shard}")
-                    
-                    # Reload the inference engine with new shard
-                    # This will trigger re-wrapping of the model with new layer range
-                    await self.inference_engine.ensure_shard(new_shard)
-                    self.current_shard = new_shard
-                    
-                    logger.info("✅ Model shard reloaded with new layer range")
-                else:
-                    logger.error("❌ Failed to get new shard assignment")
-                
-                logger.info("")
-            else:
-                logger.info("Layer assignment unchanged, no model reload needed")
-                
         except Exception as e:
             logger.error(f"Failed to re-initialize ring: {e}", exc_info=True)
 
