@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 from ring_pipeline import RingPipelineCoordinator
 from shard import Shard
+from stats_logger import get_stats_logger
 from transformers_inference import TransformersShardedInferenceEngine
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,9 @@ class LLMService:
         # Distributed inference state
         self.max_generate_tokens = 50
         self.default_sample_temperature = 0.7
+
+        # Stats logger for generation metrics
+        self.stats_logger = get_stats_logger()
 
     async def start(
         self, model_name: Optional[str] = None, num_layers: Optional[int] = None
@@ -282,8 +286,41 @@ class LLMService:
     async def _process_query(self, query_id: str, query: str):
         """Process a query using the LLM model (single-node mode)"""
         try:
+            # Start stats logging
+            self.stats_logger.start_generation(
+                request_id=query_id,
+                prompt=query,
+                query_id=query_id,
+                max_tokens=100,  # Default for single-node mode
+                temperature=0.7,
+            )
+            
+            self.stats_logger.log_inference_start(query_id)
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(None, self._run_inference, query)
+            self.stats_logger.log_inference_end(query_id)
+            
+            # Note: We don't have token IDs in single-node mode easily, so we'll estimate
+            # You could update _run_inference to return tokens if needed
+            model_info = {
+                "model_name": self.model_name,
+                "mode": "single" if not self.is_bitnet else "bitnet",
+                "device": "cuda" if self._has_cuda() else "cpu",
+            }
+            
+            network_info = {
+                "num_nodes": 1,
+            }
+            
+            # End stats logging (with empty token list since we don't track in single mode)
+            self.stats_logger.end_generation(
+                request_id=query_id,
+                response=response,
+                generated_token_ids=[],  # Not tracked in single-node mode
+                model_info=model_info,
+                network_info=network_info,
+            )
+            
             result = {
                 "llm_type": LLMMessageType.RESPONSE.value,
                 "query_id": query_id,
@@ -296,6 +333,16 @@ class LLMService:
             await self._send_llm_data(result)
         except Exception as e:
             logger.error(f"Error processing query: {e}")
+            
+            # Log error to stats
+            self.stats_logger.end_generation(
+                request_id=query_id,
+                response="",
+                generated_token_ids=[],
+                model_info={"model_name": self.model_name, "mode": "single"},
+                error=str(e),
+            )
+            
             error_response = {
                 "llm_type": LLMMessageType.STATUS.value,
                 "query_id": query_id,
@@ -306,6 +353,14 @@ class LLMService:
         finally:
             if query_id in self.pending_queries:
                 del self.pending_queries[query_id]
+
+    def _has_cuda(self) -> bool:
+        """Check if CUDA is available."""
+        try:
+            import torch
+            return torch.cuda.is_available()
+        except ImportError:
+            return False
 
     def _run_inference(self, query: str) -> str:
         """Run inference on the model (runs in a separate thread)"""
@@ -493,13 +548,26 @@ class LLMService:
         logger.info(f"Starting sharded inference for request {request_id}")
 
         try:
+            # Start stats logging
+            self.stats_logger.start_generation(
+                request_id=request_id,
+                prompt=prompt,
+                max_tokens=self.max_generate_tokens,
+                temperature=self.default_sample_temperature,
+            )
+
             # Track request
             self.network.outstanding_requests[request_id] = "processing"
             self.network.buffered_token_output[request_id] = ([], False)
 
             # Encode prompt
+            self.stats_logger.log_encoding_start(request_id)
             tokens = await self.inference_engine.encode(self.current_shard, prompt)
             input_tensor = tokens.reshape(1, -1)
+            self.stats_logger.log_encoding_end(request_id, len(tokens))
+
+            # Start inference timing
+            self.stats_logger.log_inference_start(request_id)
 
             # Run first shard
             output_tensor, inference_state = await self.inference_engine.infer_tensor(
@@ -519,38 +587,50 @@ class LLMService:
         except Exception as e:
             logger.error(f"Error in sharded inference start: {e}", exc_info=True)
             self.network.outstanding_requests.pop(request_id, None)
+            
+            # Log error to stats
+            self.stats_logger.end_generation(
+                request_id=request_id,
+                response="",
+                generated_token_ids=[],
+                model_info={"model_name": self.model_name, "mode": "sharded"},
+                error=str(e),
+            )
 
     async def _handle_last_shard_output(
         self, request_id: str, logits: np.ndarray, inference_state: Dict
     ):
         """Handle output from the last shard - sample and optionally continue generation."""
         # Sample next token
+        step_start = time.time()
         token = await self.inference_engine.sample(
             logits, temp=self.default_sample_temperature
         )
+        step_time = time.time() - step_start
 
         # Add to buffer
         if request_id not in self.network.buffered_token_output:
             self.network.buffered_token_output[request_id] = ([], False)
 
-        self.network.buffered_token_output[request_id][0].append(int(token.item()))
+        tokens_list = self.network.buffered_token_output[request_id][0]
+        tokens_list.append(int(token.item()))
+        
+        # Track TTFT and step times
+        if len(tokens_list) == 1:
+            self.stats_logger.log_first_token(request_id)
+        self.stats_logger.log_generation_step(request_id, step_time * 1000)
 
         # Check if finished
         is_finished = (
             int(token.item()) == self.inference_engine.tokenizer.eos_token_id
-            or len(self.network.buffered_token_output[request_id][0])
-            >= self.max_generate_tokens
+            or len(tokens_list) >= self.max_generate_tokens
         )
 
-        self.network.buffered_token_output[request_id] = (
-            self.network.buffered_token_output[request_id][0],
-            is_finished,
-        )
+        self.network.buffered_token_output[request_id] = (tokens_list, is_finished)
 
         # Decode and send intermediate result
-        tokens_so_far = self.network.buffered_token_output[request_id][0]
         text = await self.inference_engine.decode(
-            self.current_shard, np.array(tokens_so_far)
+            self.current_shard, np.array(tokens_list)
         )
 
         response = {
@@ -572,6 +652,31 @@ class LLMService:
                 request_id, output_tensor, inference_state
             )
         else:
+            # Mark inference end and log stats
+            self.stats_logger.log_inference_end(request_id)
+            
+            # Collect model and network info
+            model_info = {
+                "model_name": self.model_name,
+                "total_layers": self.num_layers,
+                "layers_on_node": self.current_shard.end_layer - self.current_shard.start_layer + 1,
+                "mode": "sharded",
+                "device": "cpu",
+            }
+            
+            network_info = {
+                "num_nodes": len(self.network.topology.all_nodes()),
+            }
+            
+            # End stats logging
+            self.stats_logger.end_generation(
+                request_id=request_id,
+                response=text,
+                generated_token_ids=tokens_list,
+                model_info=model_info,
+                network_info=network_info,
+            )
+            
             # Clean up
             self.network.outstanding_requests.pop(request_id, None)
             logger.info(f"Finished generation for request {request_id}")
@@ -687,6 +792,15 @@ class LLMService:
             if self.ring_coordinator.ring_position.is_head:
                 logger.info(f"Head node starting ring inference for: {query[:50]}...")
 
+                # Start stats logging
+                self.stats_logger.start_generation(
+                    request_id=query_id,
+                    prompt=query,
+                    query_id=query_id,
+                    max_tokens=self.max_generate_tokens,
+                    temperature=self.default_sample_temperature,
+                )
+
                 # Pass base_shard (full model spec) to ring coordinator
                 # The ring coordinator will create node-specific shards from layer windows
                 generated_tokens = await self.ring_coordinator.start_inference(
@@ -700,6 +814,37 @@ class LLMService:
                 response_text = await self.inference_engine.decode(
                     self.current_shard,  # Use current_shard for actual decoding
                     np.array(generated_tokens),
+                )
+
+                # Collect model info
+                model_info = {
+                    "model_name": self.model_name,
+                    "total_layers": self.num_layers,
+                    "layers_on_node": (
+                        self.ring_coordinator.layer_window.layer_end
+                        - self.ring_coordinator.layer_window.layer_start
+                        + 1
+                    ),
+                    "mode": "ring",
+                    "device": "cpu",  # Can be detected dynamically if needed
+                }
+
+                # Collect network info
+                network_info = {
+                    "num_nodes": self.ring_coordinator.ring_position.world_size,
+                    "rank": self.ring_coordinator.ring_position.rank,
+                    "world_size": self.ring_coordinator.ring_position.world_size,
+                    "layer_window_start": self.ring_coordinator.layer_window.layer_start,
+                    "layer_window_end": self.ring_coordinator.layer_window.layer_end,
+                }
+
+                # End stats logging
+                self.stats_logger.end_generation(
+                    request_id=query_id,
+                    response=response_text,
+                    generated_token_ids=generated_tokens,
+                    model_info=model_info,
+                    network_info=network_info,
                 )
 
                 result = {
@@ -731,6 +876,21 @@ class LLMService:
 
         except Exception as e:
             logger.error(f"Ring inference error: {e}", exc_info=True)
+            
+            # Log error to stats if head node
+            if (
+                self.ring_coordinator
+                and self.ring_coordinator.ring_position
+                and self.ring_coordinator.ring_position.is_head
+            ):
+                self.stats_logger.end_generation(
+                    request_id=query_id,
+                    response="",
+                    generated_token_ids=[],
+                    model_info={"model_name": self.model_name, "mode": "ring"},
+                    error=str(e),
+                )
+            
             error_response = {
                 "llm_type": LLMMessageType.STATUS.value,
                 "query_id": query_id,

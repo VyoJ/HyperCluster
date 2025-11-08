@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from shard import Shard
+from stats_logger import get_stats_logger
 
 logger = logging.getLogger(__name__)
 
@@ -300,11 +301,16 @@ class RingPipelineCoordinator:
         logger.info(f"Clearing any existing cache for request {request_id}")
         self.inference_engine.caches.pop(request_id, None)
 
+        # Get stats logger
+        stats_logger = get_stats_logger()
+
         # Encode prompt
+        stats_logger.log_encoding_start(request_id)
         start_time = time.time()
         tokens = await self.inference_engine.encode(shard, prompt)
         input_tokens = tokens.reshape(1, -1)
         encode_time = time.time() - start_time
+        stats_logger.log_encoding_end(request_id, len(tokens))
 
         logger.info("")
         logger.info("📝 Encoding complete:")
@@ -314,6 +320,9 @@ class RingPipelineCoordinator:
         logger.info("=" * 80)
 
         generated_tokens = []
+
+        # Start inference timing
+        stats_logger.log_inference_start(request_id)
 
         # Auto-regressive generation loop
         for step in range(max_tokens):
@@ -330,7 +339,7 @@ class RingPipelineCoordinator:
                 if hasattr(cache, "key_cache"):
                     logger.info(f"   ✅ Cache exists: {len(cache.key_cache)} layers")
                     if len(cache.key_cache) > 0 and cache.key_cache[0] is not None:
-                        logger.info(f"   Cache seq_len: {cache.key_cache[0].shape[2]}")
+                        logger.info(f"   Cache seq_len: ERROR")
                 else:
                     logger.info(f"   ✅ Cache exists (tuple): {len(cache)} layers")
             else:
@@ -364,7 +373,7 @@ class RingPipelineCoordinator:
                 request_id=request_id,
                 input_data=input_tokens,
                 shard=shard,
-                initial_position=current_position,  # Pass actual token position!
+                initial_position=current_position  # Pass actual token position!
             )
 
             if logits is None:
@@ -381,6 +390,11 @@ class RingPipelineCoordinator:
             generated_tokens.append(token_id)
 
             step_time = time.time() - step_start
+            
+            # Track TTFT and step times
+            if step == 0:
+                stats_logger.log_first_token(request_id)
+            stats_logger.log_generation_step(request_id, step_time * 1000)
 
             logger.info(f"   ✅ Token {step + 1} sampled: {token_id}")
             logger.info(f"   ⏱️  Step time: {step_time * 1000:.1f}ms")
@@ -418,6 +432,9 @@ class RingPipelineCoordinator:
 
             # Prepare for next iteration
             input_tokens = next_token.reshape(1, 1)
+
+        # Mark inference end
+        stats_logger.log_inference_end(request_id)
 
         total_time = time.time() - start_time
 
@@ -814,7 +831,7 @@ class RingPipelineCoordinator:
                         )
                         if len(cache.key_cache) > 0 and cache.key_cache[0] is not None:
                             logger.info(
-                                f"   Cache seq_len: {cache.key_cache[0].shape[2]}"
+                                f"   Cache seq_len: ERROR"
                             )
                     else:
                         logger.info(f"   ✅ Cache exists (tuple): {len(cache)} layers")
