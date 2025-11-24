@@ -251,7 +251,7 @@ def assess_llm_capability(hardware_info):
             ram_gb = float(ram_str.replace("GB", ""))
         elif "MB" in ram_str:
             ram_gb = float(ram_str.replace("MB", "")) / 1024
-    except:
+    except Exception:
         ram_gb = 0
 
     assessment["details"]["ram"] = {
@@ -267,21 +267,21 @@ def assess_llm_capability(hardware_info):
     }
 
     if ram_gb < 8:
-        assessment["details"]["ram"][
-            "recommendation"
-        ] = "Consider upgrading RAM to at least 16GB for running smaller LLMs"
+        assessment["details"]["ram"]["recommendation"] = (
+            "Consider upgrading RAM to at least 16GB for running smaller LLMs"
+        )
     elif ram_gb < 16:
-        assessment["details"]["ram"][
-            "recommendation"
-        ] = "Sufficient for smaller models with quantization"
+        assessment["details"]["ram"]["recommendation"] = (
+            "Sufficient for smaller models with quantization"
+        )
     elif ram_gb < 32:
-        assessment["details"]["ram"][
-            "recommendation"
-        ] = "Good for most quantized models up to ~13B parameters"
+        assessment["details"]["ram"]["recommendation"] = (
+            "Good for most quantized models up to ~13B parameters"
+        )
     else:
-        assessment["details"]["ram"][
-            "recommendation"
-        ] = "Excellent for running multiple or larger models"
+        assessment["details"]["ram"]["recommendation"] = (
+            "Excellent for running multiple or larger models"
+        )
 
     # Analyze CPU
     cpu_cores = hardware_info["cpu"]["cores_logical"]
@@ -300,21 +300,21 @@ def assess_llm_capability(hardware_info):
     }
 
     if cpu_cores < 4:
-        assessment["details"]["cpu"][
-            "recommendation"
-        ] = "CPU will be a significant bottleneck for LLMs"
+        assessment["details"]["cpu"]["recommendation"] = (
+            "CPU will be a significant bottleneck for LLMs"
+        )
     elif cpu_cores < 8:
-        assessment["details"]["cpu"][
-            "recommendation"
-        ] = "Can run smaller models but with limited performance"
+        assessment["details"]["cpu"]["recommendation"] = (
+            "Can run smaller models but with limited performance"
+        )
     elif cpu_cores < 16:
-        assessment["details"]["cpu"][
-            "recommendation"
-        ] = "Good for most CPU-based inference"
+        assessment["details"]["cpu"]["recommendation"] = (
+            "Good for most CPU-based inference"
+        )
     else:
-        assessment["details"]["cpu"][
-            "recommendation"
-        ] = "Excellent for CPU-based inference"
+        assessment["details"]["cpu"]["recommendation"] = (
+            "Excellent for CPU-based inference"
+        )
 
     # Analyze GPU
     gpu_assessment = "None"
@@ -330,7 +330,7 @@ def assess_llm_capability(hardware_info):
         vram_gb = 0
         try:
             vram_gb = float(gpu["memory_total_MB"]) / 1024
-        except:
+        except Exception:
             vram_gb = 0
 
         if vram_gb < 4:
@@ -371,7 +371,7 @@ def assess_llm_capability(hardware_info):
                         gpu_assessment = "Basic (AMD)"
                     else:
                         gpu_assessment = "Good (AMD)"
-                except:
+                except Exception:
                     gpu_assessment = "Unknown capability (AMD)"
             else:
                 gpu_assessment = "Unknown capability (AMD)"
@@ -463,10 +463,10 @@ def collect_hardware_info():
 def display_hardware_info(info):
     """Display the collected hardware information in a readable format"""
     print("\n" + "=" * 80)
-    print(f"SYSTEM HARDWARE INFORMATION FOR LLM COMPATIBILITY")
+    print("SYSTEM HARDWARE INFORMATION FOR LLM COMPATIBILITY")
     print("=" * 80)
 
-    print(f"\n📊 OVERALL LLM ASSESSMENT:")
+    print("\n📊 OVERALL LLM ASSESSMENT:")
     print(f"   {info['llm_assessment']['summary']}")
 
     print("\n💻 SYSTEM INFORMATION:")
@@ -542,9 +542,7 @@ def display_hardware_info(info):
         )
 
     print("\n" + "=" * 80)
-    print(
-        f"💡 Note: This assessment is based on typical requirements for current LLMs."
-    )
+    print("💡 Note: This assessment is based on typical requirements for current LLMs.")
     print("=" * 80 + "\n")
 
 

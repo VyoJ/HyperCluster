@@ -14,7 +14,6 @@ Logs detailed statistics for each LLM generation including:
 
 import json
 import logging
-import os
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime

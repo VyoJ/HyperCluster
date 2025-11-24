@@ -48,7 +48,7 @@ class Node:
             str, Tuple[List[int], bool]
         ] = {}  # request_id -> (tokens, is_finished)
         self.inference_states: Dict[str, Dict] = {}  # request_id -> inference_state
-        
+
         # Cache for binary tensor data (hash -> content)
         self.tensor_cache: Dict[str, bytes] = {}  # hash_str -> binary_content
 
@@ -67,11 +67,6 @@ class Node:
 
             # Initialize topology with this node
             await self.update_topology()
-
-            # If bootstrap nodes are provided, connect to them
-            # Note: This now happens in main.py after node is created
-            # for ticket in self.bootstrap_nodes:
-            #     await self.join_document(ticket)
 
         except Exception as e:
             logger.error(f"Failed to start Iroh node: {e}")
@@ -105,7 +100,7 @@ class Node:
             return None
         try:
             doc = await self.iroh_node.docs().create()
-            
+
             # Use RELAY_AND_ADDRESSES to ensure connectivity
             ticket = await doc.share(
                 ShareMode.WRITE, AddrInfoOptions.RELAY_AND_ADDRESSES
@@ -113,8 +108,8 @@ class Node:
             doc_id = str(doc.id())
             self.documents[doc_id] = doc
             logger.info(f"Created document with ID: {doc_id[:16]}...")
-            logger.info(f"Document sharing mode: WRITE with RELAY_AND_ADDRESSES")
-            
+            logger.info("Document sharing mode: WRITE with RELAY_AND_ADDRESSES")
+
             await self.subscribe_to_doc_events(doc)
             return str(ticket), doc_id
         except Exception as e:
@@ -132,13 +127,13 @@ class Node:
             doc_id = str(doc.id())
             self.documents[doc_id] = doc
             logger.info(f"Joined document with ID: {doc_id[:16]}...")
-            
+
             # Give Iroh time to establish sync with peers
-            logger.info(f"⏳ Waiting 2s for document sync to stabilize...")
+            logger.info("⏳ Waiting 2s for document sync to stabilize...")
             await asyncio.sleep(2.0)
 
             await self.subscribe_to_doc_events(doc)
-            logger.info(f"✅ Document joined and ready")
+            logger.info("✅ Document joined and ready")
             return doc_id
         except Exception as e:
             logger.error(f"Failed to join document: {e}")
@@ -157,8 +152,10 @@ class Node:
 
             async def event(self, event):
                 event_type = event.type()
-                logger.debug(f"🔔 Event received: {event_type} for doc {self.doc_id[:16]}...")
-                
+                logger.debug(
+                    f"🔔 Event received: {event_type} for doc {self.doc_id[:16]}..."
+                )
+
                 if event_type == LiveEventType.CONTENT_READY:
                     hash_val = event.as_content_ready()
                     await self.outer.handle_content_ready(self.doc, hash_val)
@@ -182,30 +179,40 @@ class Node:
             logger.debug(f"📦 Content ready event received, hash={hash_str[:16]}...")
             content = await self.iroh_node.blobs().read_to_bytes(content_hash)
             content_size = len(content)
-            logger.info(f"📦 Read {content_size} bytes from blob (hash={hash_str[:16]}...)")
-            
+            logger.info(
+                f"📦 Read {content_size} bytes from blob (hash={hash_str[:16]}...)"
+            )
+
             # Try to decode as JSON
             try:
                 message_data = json.loads(content.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 # This is binary data (e.g., tensor), not a JSON message
                 # Cache it by HASH (not size, to avoid collisions)
-                logger.debug(f"📦 Caching binary content: {content_size} bytes, hash={hash_str[:16]}...")
+                logger.debug(
+                    f"📦 Caching binary content: {content_size} bytes, hash={hash_str[:16]}..."
+                )
                 self.tensor_cache[hash_str] = content
                 return
-            
+
             # DIAGNOSTIC: Log received content with size
             msg_type = message_data.get("type", "unknown")
             sender = message_data.get("sender_id", "unknown")
             sender_short = sender[:16] if sender and len(sender) > 16 else sender
-            
+
             # Highlight large messages (likely tensor forwards)
             if content_size > 100000:  # > 100KB
-                logger.info(f"📨 ⚡ LARGE MESSAGE: type={msg_type}, from={sender_short}..., size={content_size/1024/1024:.2f}MB")
+                logger.info(
+                    f"📨 ⚡ LARGE MESSAGE: type={msg_type}, from={sender_short}..., size={content_size/1024/1024:.2f}MB"
+                )
             else:
-                logger.debug(f"📨 Content ready: type={msg_type}, from={sender_short}..., size={content_size} bytes")
+                logger.debug(
+                    f"📨 Content ready: type={msg_type}, from={sender_short}..., size={content_size} bytes"
+                )
 
-            logger.debug(f"📨 Calling {len(self.message_handlers)} message handler(s)...")
+            logger.debug(
+                f"📨 Calling {len(self.message_handlers)} message handler(s)..."
+            )
             for handler in self.message_handlers:
                 await handler(message_data)
 
@@ -227,23 +234,26 @@ class Node:
             payload_json = json.dumps(message)
             payload = payload_json.encode("utf-8")
             payload_size = len(payload)
-            
+
             msg_type = message.get("type", "unknown")
-            
+
             # Highlight large messages
             if payload_size > 100000:  # > 100KB
-                logger.info(f"📤 Writing LARGE message to doc {doc_id[:16]}...: type={msg_type}, size={payload_size/1024/1024:.2f}MB")
+                logger.info(
+                    f"📤 Writing LARGE message to doc {doc_id[:16]}...: type={msg_type}, size={payload_size/1024/1024:.2f}MB"
+                )
             else:
-                logger.debug(f"📤 Writing to doc {doc_id[:16]}...: type={msg_type}, size={payload_size} bytes")
-            
+                logger.debug(
+                    f"📤 Writing to doc {doc_id[:16]}...: type={msg_type}, size={payload_size} bytes"
+                )
+
             await doc.set_bytes(author, key, payload)
-            
-            logger.debug(f"✅ Successfully wrote message to document")
-            
-            # Small delay for document sync (no longer needed for large payloads since we use blobs)
+
+            logger.debug("✅ Successfully wrote message to document")
+
             if payload_size > 10000:  # Only for moderately large metadata
                 await asyncio.sleep(0.1)
-            
+
             return True
         except Exception as e:
             logger.error(f"Failed to send message: {e}", exc_info=True)
@@ -458,7 +468,7 @@ class Node:
     async def handle_ring_tensor_message(self, message_data: Dict, llm_service):
         """
         Handle incoming ring tensor forward message.
-        
+
         This fetches the tensor blob and passes it to the ring coordinator.
         Uses Iroh blobs for efficient large data transfer.
         """
@@ -467,112 +477,137 @@ class Node:
             target_node_id = message_data.get("target_node_id")
             payload = message_data.get("payload", {})
             request_id = message_data.get("request_id", "unknown")
-            
+
             # Check if this message is for us
             my_node_id = str(await self.iroh_node.net().node_id())
-            
-            logger.info(f"   Checking target: target={target_node_id[:16] if target_node_id else 'broadcast'}..., me={my_node_id[:16]}...")
-            
+
+            logger.info(
+                f"   Checking target: target={target_node_id[:16] if target_node_id else 'broadcast'}..., me={my_node_id[:16]}..."
+            )
+
             # Only process if:
             # 1. No target specified (broadcast), OR
             # 2. We are the target
             if target_node_id and target_node_id != my_node_id:
-                logger.info(f"   ↩️  Ignoring ring tensor meant for {target_node_id[:16]}... (I am {my_node_id[:16]}...)")
+                logger.info(
+                    f"   ↩️  Ignoring ring tensor meant for {target_node_id[:16]}... (I am {my_node_id[:16]}...)"
+                )
                 return
-            
-            logger.info(f"")
-            logger.info(f"📨 RECEIVED RING TENSOR MESSAGE")
+
+            logger.info("")
+            logger.info("📨 RECEIVED RING TENSOR MESSAGE")
             logger.info(f"   From: {sender_id[:16] if sender_id else 'unknown'}...")
             logger.info(f"   Request ID: {request_id}")
-            
+
             # Check if LLM service and ring coordinator are available
             if not llm_service:
                 logger.warning("   ⚠️  No LLM service available")
                 return
-            
+
             if not llm_service.ring_coordinator:
                 logger.warning("   ⚠️  No ring coordinator available")
                 return
-            
+
             if not llm_service.is_running:
                 logger.warning("   ⚠️  LLM service not running")
                 return
-            
+
             # Get tensor key and metadata
             tensor_key_str = payload.get("tensor_key", "")
             tensor_hash_str = payload.get("tensor_hash", "")  # The actual blob hash!
-            
+
             if not tensor_key_str:
                 logger.error("   ❌ No tensor key in message")
                 return
-            
+
             tensor_shape = tuple(payload.get("tensor_shape", []))
             tensor_dtype = np.dtype(payload.get("tensor_dtype", "float32"))
             tensor_size = payload.get("tensor_size", 0)
             is_final = payload.get("is_final", False)
-            
+
             logger.info(f"   Tensor key: {tensor_key_str[:32]}...")
             logger.info(f"   Tensor hash: {tensor_hash_str[:16]}...")
-            logger.info(f"   Tensor shape: {tensor_shape}, dtype: {tensor_dtype}, size: {tensor_size/1024/1024:.2f}MB")
+            logger.info(
+                f"   Tensor shape: {tensor_shape}, dtype: {tensor_dtype}, size: {tensor_size/1024/1024:.2f}MB"
+            )
             logger.info(f"   Is final: {is_final}")
-            
+
             # Extract position_ids and attention_mask from payload (CRITICAL!)
             position_ids_list = payload.get("position_ids")
             attention_mask_list = payload.get("attention_mask")
-            
-            position_ids = np.array(position_ids_list, dtype=np.int64) if position_ids_list is not None else None
-            attention_mask = np.array(attention_mask_list, dtype=np.bool_) if attention_mask_list is not None else None
-            
+
+            position_ids = (
+                np.array(position_ids_list, dtype=np.int64)
+                if position_ids_list is not None
+                else None
+            )
+            attention_mask = (
+                np.array(attention_mask_list, dtype=np.bool_)
+                if attention_mask_list is not None
+                else None
+            )
+
             logger.info(f"   Has position_ids: {position_ids is not None}")
             logger.info(f"   Has attention_mask: {attention_mask is not None}")
             if position_ids is not None:
-                logger.info(f"   Position_ids shape: {position_ids.shape}, content: {position_ids}")
-            
+                logger.info(
+                    f"   Position_ids shape: {position_ids.shape}, content: {position_ids}"
+                )
+
             # Fetch tensor from cache
             # We cached the tensor content when we saw it arrive as binary
             fetch_start = time.time()
-            logger.info(f"   📥 Fetching tensor from cache...")
-            
+            logger.info("   📥 Fetching tensor from cache...")
+
             # Fetch tensor: First check cache, then actively fetch via blobs client
             # CRITICAL: Don't rely on passive CONTENT_READY events - they can be slow!
             max_wait = 30.0  # seconds - increased timeout
             wait_start = time.time()
             tensor_bytes = None
-            
+
             expected_hash = tensor_hash_str
             expected_size = tensor_size
-            
+
             logger.info(f"   🎯 Looking for tensor hash: {expected_hash[:16]}...")
-            
+
             # Check cache first (in case CONTENT_READY already fired)
             if expected_hash in self.tensor_cache:
                 tensor_bytes = self.tensor_cache[expected_hash]
-                logger.info(f"   ✅ Found cached tensor immediately: {len(tensor_bytes)} bytes")
+                logger.info(
+                    f"   ✅ Found cached tensor immediately: {len(tensor_bytes)} bytes"
+                )
                 del self.tensor_cache[expected_hash]
             else:
                 # Not in cache - actively fetch it using blobs client
                 logger.info("   📡 Not in cache, actively fetching blob...")
                 try:
                     from iroh import Hash
+
                     tensor_hash_obj = Hash.from_string(expected_hash)
-                    
+
                     # Try to fetch blob in a loop with retries
                     retry_count = 0
                     while time.time() - wait_start < max_wait:
                         try:
                             # Active fetch - this will block until blob is available
-                            tensor_bytes = await self.iroh_node.blobs().read_to_bytes(tensor_hash_obj)
-                            logger.info(f"   ✅ Fetched tensor via blobs client: {len(tensor_bytes)} bytes (attempt {retry_count + 1})")
+                            tensor_bytes = await self.iroh_node.blobs().read_to_bytes(
+                                tensor_hash_obj
+                            )
+                            logger.info(
+                                f"   ✅ Fetched tensor via blobs client: {len(tensor_bytes)} bytes (attempt {retry_count + 1})"
+                            )
                             break
                         except Exception as read_error:
                             retry_count += 1
                             # Check cache again (maybe CONTENT_READY fired while we were trying)
                             if expected_hash in self.tensor_cache:
                                 tensor_bytes = self.tensor_cache[expected_hash]
-                                logger.info(f"   ✅ Found in cache during retry: {len(tensor_bytes)} bytes")
+                                logger.info(
+                                    f"   ✅ Found in cache during retry: {len(tensor_bytes)} bytes"
+                                )
                                 del self.tensor_cache[expected_hash]
                                 break
-                            
+
                             elapsed = time.time() - wait_start
                             if int(elapsed) % 3 == 0:  # Log every 3 seconds
                                 logger.debug(
@@ -581,24 +616,30 @@ class Node:
                             await asyncio.sleep(0.1)
                 except Exception as e:
                     logger.error(f"   ❌ Error setting up blob fetch: {e}")
-            
+
             if tensor_bytes is None:
-                logger.error(f"   ❌ Timeout waiting for tensor to arrive (waited {max_wait}s)")
+                logger.error(
+                    f"   ❌ Timeout waiting for tensor to arrive (waited {max_wait}s)"
+                )
                 logger.error(f"   Expected hash: {expected_hash[:16]}...")
                 logger.error(f"   Expected size: {expected_size} bytes")
-                logger.error(f"   Cache contents (first 5): {[(h[:16], len(c)) for h, c in list(self.tensor_cache.items())[:5]]}")
+                logger.error(
+                    f"   Cache contents (first 5): {[(h[:16], len(c)) for h, c in list(self.tensor_cache.items())[:5]]}"
+                )
                 logger.error(f"   Total cache entries: {len(self.tensor_cache)}")
                 return
-            
+
             fetch_time = time.time() - fetch_start
             logger.info(f"   ✅ Tensor retrieved in {fetch_time*1000:.1f}ms")
-            
+
             # Reconstruct tensor
-            tensor = np.frombuffer(tensor_bytes, dtype=tensor_dtype).reshape(tensor_shape)
+            tensor = np.frombuffer(tensor_bytes, dtype=tensor_dtype).reshape(
+                tensor_shape
+            )
             logger.info(f"   ✅ Tensor reconstructed: shape={tensor.shape}")
-            
+
             # Pass to ring coordinator WITH position_ids and attention_mask (CRITICAL!)
-            logger.info(f"   ✅ Passing to ring coordinator...")
+            logger.info("   ✅ Passing to ring coordinator...")
             await llm_service.ring_coordinator.handle_incoming_tensor(
                 sender_id=sender_id,
                 request_id=request_id,
@@ -606,8 +647,8 @@ class Node:
                 shard=llm_service.current_shard,
                 is_final=is_final,
                 position_ids=position_ids,  # CRITICAL: Pass position info for RoPE
-                attention_mask=attention_mask  # CRITICAL: Pass attention mask
+                attention_mask=attention_mask,  # CRITICAL: Pass attention mask
             )
-        
+
         except Exception as e:
             logger.error(f"❌ Error handling ring tensor: {e}", exc_info=True)

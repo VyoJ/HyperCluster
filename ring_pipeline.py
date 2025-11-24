@@ -339,7 +339,7 @@ class RingPipelineCoordinator:
                 if hasattr(cache, "key_cache"):
                     logger.info(f"   ✅ Cache exists: {len(cache.key_cache)} layers")
                     if len(cache.key_cache) > 0 and cache.key_cache[0] is not None:
-                        logger.info(f"   Cache seq_len: ERROR")
+                        logger.info("   Cache seq_len: ERROR")
                 else:
                     logger.info(f"   ✅ Cache exists (tuple): {len(cache)} layers")
             else:
@@ -373,7 +373,7 @@ class RingPipelineCoordinator:
                 request_id=request_id,
                 input_data=input_tokens,
                 shard=shard,
-                initial_position=current_position  # Pass actual token position!
+                initial_position=current_position,  # Pass actual token position!
             )
 
             if logits is None:
@@ -390,7 +390,7 @@ class RingPipelineCoordinator:
             generated_tokens.append(token_id)
 
             step_time = time.time() - step_start
-            
+
             # Track TTFT and step times
             if step == 0:
                 stats_logger.log_first_token(request_id)
@@ -830,9 +830,7 @@ class RingPipelineCoordinator:
                             f"   ✅ Cache exists: {len(cache.key_cache)} layers"
                         )
                         if len(cache.key_cache) > 0 and cache.key_cache[0] is not None:
-                            logger.info(
-                                f"   Cache seq_len: ERROR"
-                            )
+                            logger.info("   Cache seq_len: ERROR")
                     else:
                         logger.info(f"   ✅ Cache exists (tuple): {len(cache)} layers")
                 else:
