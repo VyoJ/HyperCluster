@@ -217,45 +217,6 @@ query_id = await llm_service.send_query("What is quantum computing?")
 }
 ```
 
-## Current Limitations & TODOs
-
-### Implemented ✅
-
-- [x] Shard abstraction and management
-- [x] Device capability detection
-- [x] Topology tracking
-- [x] Memory-weighted partitioning
-- [x] Transformers-based inference engine
-- [x] Single-node sharded inference
-- [x] Message protocol for tensor forwarding
-- [x] LLM service integration
-
-### In Progress / Future Work 🚧
-
-- [ ] **Multi-node tensor forwarding**: Currently logs but doesn't forward
-  - Need to implement routing logic
-  - Handle tensor deserialization on receiving node
-  - Coordinate request IDs across nodes
-
-- [ ] **Layer extraction**: Currently loads full model
-  - Implement true layer extraction to save memory
-  - Load only assigned layers from checkpoint
-
-- [ ] **Error handling**: Robust failure recovery
-  - Handle node disconnections
-  - Re-route inference on failure
-  - Checkpoint/resume support
-
-- [ ] **Performance optimization**:
-  - Quantization support (4-bit, 8-bit)
-  - Flash attention integration
-  - Pipeline parallelism
-
-- [ ] **Model support**:
-  - Currently tested with Qwen/Llama architectures
-  - Extend to other model families
-  - Support for multimodal models
-
 ## Testing
 
 ### Single-Node Test
