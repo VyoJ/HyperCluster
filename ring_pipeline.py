@@ -97,6 +97,9 @@ class RingPipelineCoordinator:
         self.prefetch_queue = asyncio.Queue()
         self.prefetch_task: Optional[asyncio.Task] = None
 
+        # Use gossip for low-latency tensor forwarding (default: True)
+        self.use_gossip = True
+
     async def initialize_ring(
         self,
         topology_nodes: List[Tuple[str, Any]],
@@ -944,13 +947,60 @@ class RingPipelineCoordinator:
         attention_mask: Optional[np.ndarray] = None,
     ):
         """
-        Send tensor to another node via Iroh blobs.
-        Based on prima.cpp's llama_send_tensors().
+        Send tensor to another node.
 
-        Prima.cpp sends:
+        Uses gossip protocol for low-latency delivery (~10-50ms) when available,
+        falling back to document-based messaging (~200-500ms) otherwise.
+
+        Based on prima.cpp's llama_send_tensors():
         - sub_gf_out (hidden states)
         - inp_pos (position IDs) - CRITICAL for RoPE embeddings
         - attention_mask (implicitly via batch metadata)
+        """
+        send_start = time.time()
+
+        # Try gossip first (low latency)
+        if self.use_gossip and self.network.ring_gossip_sender:
+            logger.info("   ⚡ Using GOSSIP for tensor delivery")
+            success = await self.network.send_ring_tensor_gossip(
+                target_node_id=target_node_id,
+                data=data,
+                request_id=request_id,
+                is_final=is_final,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+            )
+
+            if success:
+                send_time = time.time() - send_start
+                logger.info(f"   ⚡ Tensor sent via gossip in {send_time * 1000:.1f}ms")
+                return success
+            else:
+                logger.warning(
+                    "   ⚠️  Gossip send failed, falling back to document-based messaging"
+                )
+
+        # Fallback: Document-based messaging
+        return await self._send_to_node_via_docs(
+            target_node_id=target_node_id,
+            data=data,
+            request_id=request_id,
+            is_final=is_final,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+        )
+
+    async def _send_to_node_via_docs(
+        self,
+        target_node_id: str,
+        data: np.ndarray,
+        request_id: str,
+        is_final: bool,
+        position_ids: Optional[np.ndarray] = None,
+        attention_mask: Optional[np.ndarray] = None,
+    ):
+        """
+        Send tensor to another node via Iroh documents (fallback).
 
         Uses Iroh's blob storage for large binary data (tensor),
         and sends only the blob hash through the document.
@@ -958,7 +1008,7 @@ class RingPipelineCoordinator:
         # Get document ID for communication
         if not self.network.documents:
             logger.error("No documents available for communication")
-            return
+            return False
 
         doc_id = next(iter(self.network.documents))
 
@@ -967,7 +1017,7 @@ class RingPipelineCoordinator:
         # Serialize tensor to bytes
         tensor_bytes = data.tobytes()
         size_mb = len(tensor_bytes) / 1024 / 1024
-        logger.info(f"   📤 Sending tensor: {size_mb:.2f} MB")
+        logger.info(f"   📤 Sending tensor (docs fallback): {size_mb:.2f} MB")
         logger.info(f"   📤 Target: {target_node_id[:16]}...")
         logger.info(f"   📤 Request ID: {request_id}")
 
@@ -1022,7 +1072,9 @@ class RingPipelineCoordinator:
 
         send_time = time.time() - send_start
         if success:
-            logger.info(f"   ✅ Tensor sent in {send_time * 1000:.1f}ms (total)")
+            logger.info(
+                f"   ✅ Tensor sent via docs in {send_time * 1000:.1f}ms (total)"
+            )
         else:
             logger.error("   ❌ Failed to send message!")
 

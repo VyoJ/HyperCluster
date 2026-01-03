@@ -294,12 +294,12 @@ class LLMService:
                 max_tokens=100,  # Default for single-node mode
                 temperature=0.7,
             )
-            
+
             self.stats_logger.log_inference_start(query_id)
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(None, self._run_inference, query)
             self.stats_logger.log_inference_end(query_id)
-            
+
             # Note: We don't have token IDs in single-node mode easily, so we'll estimate
             # You could update _run_inference to return tokens if needed
             model_info = {
@@ -307,11 +307,11 @@ class LLMService:
                 "mode": "single" if not self.is_bitnet else "bitnet",
                 "device": "cuda" if self._has_cuda() else "cpu",
             }
-            
+
             network_info = {
                 "num_nodes": 1,
             }
-            
+
             # End stats logging (with empty token list since we don't track in single mode)
             self.stats_logger.end_generation(
                 request_id=query_id,
@@ -320,7 +320,7 @@ class LLMService:
                 model_info=model_info,
                 network_info=network_info,
             )
-            
+
             result = {
                 "llm_type": LLMMessageType.RESPONSE.value,
                 "query_id": query_id,
@@ -333,7 +333,7 @@ class LLMService:
             await self._send_llm_data(result)
         except Exception as e:
             logger.error(f"Error processing query: {e}")
-            
+
             # Log error to stats
             self.stats_logger.end_generation(
                 request_id=query_id,
@@ -342,7 +342,7 @@ class LLMService:
                 model_info={"model_name": self.model_name, "mode": "single"},
                 error=str(e),
             )
-            
+
             error_response = {
                 "llm_type": LLMMessageType.STATUS.value,
                 "query_id": query_id,
@@ -358,6 +358,7 @@ class LLMService:
         """Check if CUDA is available."""
         try:
             import torch
+
             return torch.cuda.is_available()
         except ImportError:
             return False
@@ -587,7 +588,7 @@ class LLMService:
         except Exception as e:
             logger.error(f"Error in sharded inference start: {e}", exc_info=True)
             self.network.outstanding_requests.pop(request_id, None)
-            
+
             # Log error to stats
             self.stats_logger.end_generation(
                 request_id=request_id,
@@ -614,7 +615,7 @@ class LLMService:
 
         tokens_list = self.network.buffered_token_output[request_id][0]
         tokens_list.append(int(token.item()))
-        
+
         # Track TTFT and step times
         if len(tokens_list) == 1:
             self.stats_logger.log_first_token(request_id)
@@ -654,20 +655,22 @@ class LLMService:
         else:
             # Mark inference end and log stats
             self.stats_logger.log_inference_end(request_id)
-            
+
             # Collect model and network info
             model_info = {
                 "model_name": self.model_name,
                 "total_layers": self.num_layers,
-                "layers_on_node": self.current_shard.end_layer - self.current_shard.start_layer + 1,
+                "layers_on_node": self.current_shard.end_layer
+                - self.current_shard.start_layer
+                + 1,
                 "mode": "sharded",
                 "device": "cpu",
             }
-            
+
             network_info = {
                 "num_nodes": len(self.network.topology.all_nodes()),
             }
-            
+
             # End stats logging
             self.stats_logger.end_generation(
                 request_id=request_id,
@@ -676,7 +679,7 @@ class LLMService:
                 model_info=model_info,
                 network_info=network_info,
             )
-            
+
             # Clean up
             self.network.outstanding_requests.pop(request_id, None)
             logger.info(f"Finished generation for request {request_id}")
@@ -700,7 +703,7 @@ class LLMService:
         )
 
     async def _init_ring_pipeline(self):
-        """Initialize ring pipeline coordinator."""
+        """Initialize ring pipeline coordinator with gossip for low-latency messaging."""
         logger.info("Initializing ring pipeline mode...")
 
         self.ring_coordinator = RingPipelineCoordinator(
@@ -735,6 +738,9 @@ class LLMService:
                 f"layers=[{self.ring_coordinator.layer_window.layer_start}:"
                 f"{self.ring_coordinator.layer_window.layer_end}]"
             )
+
+            # Setup gossip for low-latency tensor forwarding
+            await self._setup_ring_gossip(topology_nodes)
         else:
             logger.warning(
                 "Cannot initialize ring: no peers found, will run in single-node mode"
@@ -747,6 +753,67 @@ class LLMService:
                 my_node_id=my_node_id,
                 model_total_layers=self.current_shard.n_layers,
             )
+
+    async def _setup_ring_gossip(self, topology_nodes: list):
+        """Setup gossip-based communication for ring pipeline."""
+        logger.info("")
+        logger.info("⚡ Setting up GOSSIP for low-latency tensor forwarding...")
+
+        # Get list of node IDs for gossip bootstrap
+        ring_node_ids = [node_id for node_id, _ in topology_nodes]
+        my_node_id = str(await self.network.iroh_node.net().node_id())
+
+        # Remove self from bootstrap list
+        other_node_ids = [nid for nid in ring_node_ids if nid != my_node_id]
+
+        if not other_node_ids:
+            logger.info("   Single-node mode: gossip not needed")
+            self.ring_coordinator.use_gossip = False
+            return
+
+        # Setup gossip subscription
+        success = await self.network.setup_ring_gossip(other_node_ids)
+
+        if success:
+            # Register handler for incoming gossip tensors
+            self.network.set_ring_tensor_handler(self._handle_gossip_tensor)
+            logger.info(
+                "✅ Gossip setup complete - tensor forwarding will use low-latency path"
+            )
+        else:
+            logger.warning(
+                "⚠️  Gossip setup failed - falling back to document-based messaging"
+            )
+            self.ring_coordinator.use_gossip = False
+
+    async def _handle_gossip_tensor(
+        self,
+        sender_id: str,
+        request_id: str,
+        tensor_data,
+        is_final: bool,
+        position_ids,
+        attention_mask,
+    ):
+        """Handle incoming tensor received via gossip."""
+        if not self.ring_coordinator:
+            logger.warning("Ring coordinator not available")
+            return
+
+        if not self.is_running:
+            logger.warning("LLM service not running")
+            return
+
+        # Pass to ring coordinator
+        await self.ring_coordinator.handle_incoming_tensor(
+            sender_id=sender_id,
+            request_id=request_id,
+            tensor_data=tensor_data,
+            shard=self.current_shard,
+            is_final=is_final,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+        )
 
     async def on_topology_update(self):
         """Handle topology updates - re-initialize ring if nodes join/leave."""
@@ -768,6 +835,9 @@ class LLMService:
             )
             return
 
+        # Cleanup old gossip subscription
+        await self.network.cleanup_ring_gossip()
+
         # Re-initialize ring with new topology
         my_node_id = str(await self.network.iroh_node.net().node_id())
 
@@ -778,6 +848,9 @@ class LLMService:
                 model_total_layers=self.base_shard.n_layers,  # Use base_shard for full model spec
             )
             logger.info("Ring re-initialized successfully")
+
+            # Re-setup gossip with new topology
+            await self._setup_ring_gossip(topology_nodes)
         except Exception as e:
             logger.error(f"Failed to re-initialize ring: {e}", exc_info=True)
 
@@ -876,7 +949,7 @@ class LLMService:
 
         except Exception as e:
             logger.error(f"Ring inference error: {e}", exc_info=True)
-            
+
             # Log error to stats if head node
             if (
                 self.ring_coordinator
@@ -890,7 +963,7 @@ class LLMService:
                     model_info={"model_name": self.model_name, "mode": "ring"},
                     error=str(e),
                 )
-            
+
             error_response = {
                 "llm_type": LLMMessageType.STATUS.value,
                 "query_id": query_id,
