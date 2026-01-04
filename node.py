@@ -37,9 +37,13 @@ class RingGossipCallback(GossipMessageCallback):
         """Handle incoming gossip messages."""
         try:
             msg_type = msg.type()
+            logger.debug(f"🔔 Gossip callback received message type: {msg_type}")
 
             if msg_type == MessageType.RECEIVED:
                 content = msg.as_received()
+                logger.info(
+                    f"📥 Gossip RECEIVED message: {len(content.content)} bytes from {content.delivered_from[:16]}..."
+                )
                 # Route to ring tensor handler
                 await self.node.handle_gossip_ring_tensor(
                     content.content, content.delivered_from

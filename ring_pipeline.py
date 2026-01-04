@@ -959,6 +959,11 @@ class RingPipelineCoordinator:
         """
         send_start = time.time()
 
+        # Debug: Log gossip availability
+        logger.debug(
+            f"   🔍 Gossip check: use_gossip={self.use_gossip}, sender={self.network.ring_gossip_sender is not None}"
+        )
+
         # Try gossip first (low latency)
         if self.use_gossip and self.network.ring_gossip_sender:
             logger.info("   ⚡ Using GOSSIP for tensor delivery")

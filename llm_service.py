@@ -777,8 +777,13 @@ class LLMService:
         if success:
             # Register handler for incoming gossip tensors
             self.network.set_ring_tensor_handler(self._handle_gossip_tensor)
+            # CRITICAL: Enable gossip on the ring coordinator
+            self.ring_coordinator.use_gossip = True
             logger.info(
                 "✅ Gossip setup complete - tensor forwarding will use low-latency path"
+            )
+            logger.info(
+                f"   use_gossip flag is now: {self.ring_coordinator.use_gossip}"
             )
         else:
             logger.warning(
