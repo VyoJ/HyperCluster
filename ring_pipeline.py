@@ -732,6 +732,20 @@ class RingPipelineCoordinator:
             data_type = "LOGITS" if current_data.shape[-1] > 10000 else "HIDDEN STATES"
             logger.info(f"   📊 Data type: {data_type} (shape={current_data.shape})")
 
+            # OPTIMIZATION: For logits, only keep the last token position
+            # This reduces network transfer size significantly (e.g., 6.96MB -> 0.58MB for vocab_size=151936)
+            # The sample() function only uses the last token's logits anyway for autoregressive generation
+            if data_type == "LOGITS" and current_data.ndim >= 2:
+                original_shape = current_data.shape
+                # Slice to keep only last token: (batch, seq_len, vocab_size) -> (batch, 1, vocab_size)
+                if current_data.ndim == 3:
+                    current_data = current_data[:, -1:, :]
+                elif current_data.ndim == 2:
+                    current_data = current_data[-1:, :]
+                logger.info(
+                    f"   📉 Optimized logits: {original_shape} → {current_data.shape} (last token only)"
+                )
+
             # SPECIAL CASE: Single node - return logits directly
             if self.ring_position and self.ring_position.world_size == 1:
                 logger.info(
