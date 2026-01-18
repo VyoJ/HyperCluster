@@ -9,6 +9,7 @@ This module implements ring-based pipelined inference where:
 """
 
 import asyncio
+import json
 import logging
 import time
 from collections import OrderedDict
@@ -96,6 +97,10 @@ class RingPipelineCoordinator:
         # Prefetch queue
         self.prefetch_queue = asyncio.Queue()
         self.prefetch_task: Optional[asyncio.Task] = None
+
+        # prime-iroh receive task
+        self.receive_task: Optional[asyncio.Task] = None
+        self.running = False
 
     async def initialize_ring(
         self,
@@ -189,9 +194,44 @@ class RingPipelineCoordinator:
             )
         logger.info("=" * 80)
 
+        # Connect prime-iroh tensor stream to next node in ring
+        if self.network.tensor_stream:
+            # Get prime-iroh node ID of next node
+            next_prime_id = self.network.prime_iroh_peer_ids.get(next_node_id)
+            if next_prime_id:
+                logger.info("🔗 Connecting prime-iroh stream to next node...")
+                logger.info(f"   Next node (iroh): {next_node_id[:16]}...")
+                logger.info(f"   Next node (prime-iroh): {next_prime_id[:16]}...")
+                try:
+                    # Connect to next node for sending (blocking operation)
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(
+                        None,
+                        self.network.tensor_stream.connect,
+                        next_prime_id,
+                        10,  # num_retries
+                    )
+                    logger.info("   ✅ prime-iroh stream connected successfully")
+                except Exception as e:
+                    logger.error(f"   ❌ Failed to connect prime-iroh stream: {e}")
+            else:
+                logger.warning(
+                    f"   ⚠️  No prime-iroh ID for next node {next_node_id[:16]}..."
+                )
+        else:
+            logger.warning(
+                "   ⚠️  prime-iroh not available, using iroh-ffi for tensor transfer"
+            )
+
         # Start prefetch worker
         if self.prefetch_task is None:
             self.prefetch_task = asyncio.create_task(self._prefetch_worker())
+
+        # Start prime-iroh receive worker
+        if self.receive_task is None and self.network.tensor_stream:
+            self.running = True
+            self.receive_task = asyncio.create_task(self._prime_iroh_receive_loop())
+            logger.info("   ✅ prime-iroh receive loop started")
 
     def _calculate_layer_windows(
         self, sorted_nodes: List[Tuple[str, Any]], total_layers: int
@@ -944,40 +984,82 @@ class RingPipelineCoordinator:
         attention_mask: Optional[np.ndarray] = None,
     ):
         """
-        Send tensor to another node via Iroh blobs.
-        Based on prima.cpp's llama_send_tensors().
+        Send tensor to another node.
+        Uses prime-iroh for efficient binary transfer if available,
+        falls back to Iroh blobs via document sync.
 
-        Prima.cpp sends:
+        Based on prima.cpp's llama_send_tensors() - sends:
         - sub_gf_out (hidden states)
         - inp_pos (position IDs) - CRITICAL for RoPE embeddings
         - attention_mask (implicitly via batch metadata)
-
-        Uses Iroh's blob storage for large binary data (tensor),
-        and sends only the blob hash through the document.
         """
-        # Get document ID for communication
-        if not self.network.documents:
-            logger.error("No documents available for communication")
-            return
-
-        doc_id = next(iter(self.network.documents))
-
         send_start = time.time()
-
-        # Serialize tensor to bytes
-        tensor_bytes = data.tobytes()
-        size_mb = len(tensor_bytes) / 1024 / 1024
+        size_mb = data.nbytes / 1024 / 1024
         logger.info(f"   📤 Sending tensor: {size_mb:.2f} MB")
         logger.info(f"   📤 Target: {target_node_id[:16]}...")
         logger.info(f"   📤 Request ID: {request_id}")
 
+        # Try prime-iroh first (direct binary transfer)
+        if self.network.tensor_stream and self.network.tensor_stream.can_send():
+            try:
+                import struct
+
+                # Pack metadata + tensor into single message
+                metadata = {
+                    "request_id": request_id,
+                    "shape": list(data.shape),
+                    "dtype": str(data.dtype),
+                    "is_final": is_final,
+                    "position_ids": position_ids.tolist()
+                    if position_ids is not None
+                    else None,
+                    "attention_mask": attention_mask.tolist()
+                    if attention_mask is not None
+                    else None,
+                }
+                metadata_json = json.dumps(metadata).encode("utf-8")
+                metadata_len = len(metadata_json)
+                tensor_bytes = data.tobytes()
+
+                # Format: [4-byte metadata length][metadata JSON][tensor bytes]
+                message = struct.pack(">I", metadata_len) + metadata_json + tensor_bytes
+
+                logger.info(
+                    f"   📦 Using prime-iroh (metadata: {metadata_len} bytes, tensor: {len(tensor_bytes)} bytes)"
+                )
+
+                # Send via prime-iroh (blocking wait in executor)
+                loop = asyncio.get_event_loop()
+                work = self.network.tensor_stream.isend(message, tag=0)
+                await loop.run_in_executor(None, work.wait)
+
+                send_time = time.time() - send_start
+                logger.info(
+                    f"   ✅ Tensor sent via prime-iroh in {send_time * 1000:.1f}ms"
+                )
+                return True
+
+            except Exception as e:
+                logger.warning(
+                    f"   ⚠️  prime-iroh send failed: {e}, falling back to iroh-ffi"
+                )
+                # Fall through to iroh-ffi fallback
+
+        # Fallback to iroh-ffi document-based transfer
+        logger.info("   📦 Using iroh-ffi document sync (fallback)")
+
+        if not self.network.documents:
+            logger.error("No documents available for communication")
+            return False
+
+        doc_id = next(iter(self.network.documents))
+        tensor_bytes = data.tobytes()
+
         # Store tensor directly in document as a binary entry
-        # This ensures it syncs to all peers automatically
         doc = self.network.documents[doc_id]
         author = await self.network.iroh_node.authors().default()
 
-        # Create unique key for this tensor with timestamp and request ID
-        # This helps the receiver identify the exact tensor
+        # Create unique key for this tensor
         timestamp_ms = int(time.time() * 1000)
         tensor_key = f"tensor-{request_id}-{timestamp_ms}".encode("utf-8")
 
@@ -988,26 +1070,22 @@ class RingPipelineCoordinator:
         logger.info(f"   ✅ Tensor written to document in {write_time * 1000:.1f}ms")
         logger.info(f"   📍 Tensor blob hash: {str(tensor_hash)[:16]}...")
 
-        # Small delay to allow sync - give Iroh time to propagate the blob
+        # Small delay to allow sync
         await asyncio.sleep(0.1)
 
         # Send metadata message with tensor key
-        # IMPORTANT: Include position_ids and attention_mask like prima.cpp does
         message = {
             "type": "ring_tensor_forward",
             "sender_id": str(await self.network.iroh_node.net().node_id()),
             "target_node_id": target_node_id,
             "request_id": request_id,
             "payload": {
-                "tensor_key": tensor_key.decode(
-                    "utf-8"
-                ),  # Key to fetch tensor from document
-                "tensor_hash": str(tensor_hash),  # Blob hash for direct lookup
+                "tensor_key": tensor_key.decode("utf-8"),
+                "tensor_hash": str(tensor_hash),
                 "tensor_shape": list(data.shape),
                 "tensor_dtype": str(data.dtype),
                 "tensor_size": len(tensor_bytes),
                 "is_final": is_final,
-                # Critical metadata (like prima.cpp's inp_pos)
                 "position_ids": position_ids.tolist()
                 if position_ids is not None
                 else None,
@@ -1084,8 +1162,99 @@ class RingPipelineCoordinator:
         if not self.prefetch_queue.full():
             await self.prefetch_queue.put(layer_id)
 
+    async def _prime_iroh_receive_loop(self):
+        """
+        Background task for receiving tensors via prime-iroh streams.
+
+        This loop continuously receives tensors from the previous node
+        in the ring and processes them.
+        """
+        import struct
+
+        logger.info("🔄 prime-iroh receive loop started")
+
+        while self.running:
+            try:
+                # Check if we can receive
+                if not self.network.tensor_stream.can_recv():
+                    await asyncio.sleep(0.01)  # Small delay before checking again
+                    continue
+
+                # Receive from tag 0 (single stream for now)
+                loop = asyncio.get_event_loop()
+                work = self.network.tensor_stream.irecv(tag=0)
+                message = await loop.run_in_executor(None, work.wait)
+
+                # Parse message: [4-byte metadata length][metadata JSON][tensor bytes]
+                metadata_len = struct.unpack(">I", message[:4])[0]
+                metadata_json = message[4 : 4 + metadata_len]
+                tensor_bytes = message[4 + metadata_len :]
+
+                metadata = json.loads(metadata_json.decode("utf-8"))
+
+                # Reconstruct tensor
+                shape = tuple(metadata["shape"])
+                dtype = np.dtype(metadata["dtype"])
+                tensor = np.frombuffer(tensor_bytes, dtype=dtype).reshape(shape)
+
+                # Extract metadata
+                request_id = metadata["request_id"]
+                is_final = metadata["is_final"]
+                position_ids = (
+                    np.array(metadata["position_ids"])
+                    if metadata.get("position_ids")
+                    else None
+                )
+                attention_mask = (
+                    np.array(metadata["attention_mask"])
+                    if metadata.get("attention_mask")
+                    else None
+                )
+
+                logger.info(
+                    f"📨 Received tensor via prime-iroh: {tensor.nbytes / 1024 / 1024:.2f} MB"
+                )
+                logger.info(f"   Request ID: {request_id}")
+                logger.info(f"   Shape: {shape}, is_final: {is_final}")
+
+                # Get the current shard from inference engine
+                shard = (
+                    self.inference_engine.shard
+                    if hasattr(self.inference_engine, "shard")
+                    else None
+                )
+
+                # Route to handle_incoming_tensor
+                await self.handle_incoming_tensor(
+                    sender_id="prime_iroh_stream",
+                    request_id=request_id,
+                    tensor_data=tensor,
+                    shard=shard,
+                    is_final=is_final,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                )
+
+            except Exception as e:
+                if self.running:  # Only log if we're supposed to be running
+                    logger.error(
+                        f"Error in prime-iroh receive loop: {e}", exc_info=True
+                    )
+                await asyncio.sleep(0.1)
+
+        logger.info("🔄 prime-iroh receive loop stopped")
+
     async def shutdown(self):
         """Shutdown the ring coordinator."""
+        self.running = False
+
+        if self.receive_task:
+            self.receive_task.cancel()
+            try:
+                await self.receive_task
+            except asyncio.CancelledError:
+                pass
+
         if self.prefetch_task:
             self.prefetch_task.cancel()
             try:

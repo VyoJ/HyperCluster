@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "iroh>=0.35.0",
+    "prime-iroh",
     "psutil>=7.0.0",
     "py-cpuinfo>=9.0.0",
     "rich>=14.0.0",

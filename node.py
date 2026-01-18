@@ -6,6 +6,16 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import iroh
 import numpy as np
+
+try:
+    from prime_iroh import Node as PrimeIrohNode
+
+    PRIME_IROH_AVAILABLE = True
+except ImportError:
+    PRIME_IROH_AVAILABLE = False
+    logger.warning(
+        "prime-iroh not available, falling back to iroh-ffi for tensor transfer"
+    )
 from device_capabilities import DeviceCapabilities, get_device_capabilities
 from iroh import AddrInfoOptions, Iroh, LiveEventType, PublicKey, ShareMode
 from partitioning_strategy import (
@@ -52,6 +62,13 @@ class Node:
         # Cache for binary tensor data (hash -> content)
         self.tensor_cache: Dict[str, bytes] = {}  # hash_str -> binary_content
 
+        # prime-iroh tensor stream for data plane
+        self.tensor_stream: Optional[PrimeIrohNode] = None
+        self.prime_iroh_node_id: Optional[str] = None
+        self.prime_iroh_peer_ids: Dict[
+            str, str
+        ] = {}  # iroh_node_id -> prime_iroh_node_id
+
     async def start(self):
         """Start the Iroh node."""
         try:
@@ -60,6 +77,21 @@ class Node:
             self.iroh_node = await Iroh.memory_with_options(options)
             node_id = await self.iroh_node.net().node_id()
             logger.info(f"Iroh node started with ID: {node_id}")
+
+            # Initialize prime-iroh tensor stream for data plane
+            if PRIME_IROH_AVAILABLE:
+                # Use a seed derived from iroh node_id for consistency
+                # Convert first 8 bytes of node_id to integer seed
+                seed = int(str(node_id)[:16], 16) & 0xFFFFFFFFFFFFFFFF
+                self.tensor_stream = PrimeIrohNode.with_seed(num_streams=4, seed=seed)
+                self.prime_iroh_node_id = self.tensor_stream.node_id()
+                logger.info(
+                    f"prime-iroh tensor stream initialized with ID: {self.prime_iroh_node_id}"
+                )
+            else:
+                logger.warning(
+                    "prime-iroh not available, using iroh-ffi for tensor transfer"
+                )
 
             # Detect device capabilities
             self.device_capabilities = await get_device_capabilities()
@@ -74,6 +106,12 @@ class Node:
 
     async def stop(self):
         """Stop the Iroh node."""
+        if self.tensor_stream:
+            try:
+                self.tensor_stream.close()
+                logger.info("prime-iroh tensor stream closed.")
+            except Exception as e:
+                logger.warning(f"Error closing tensor stream: {e}")
         if self.iroh_node:
             await self.iroh_node.node().shutdown()
             logger.info("Iroh node stopped.")
@@ -453,13 +491,19 @@ class Node:
 
         node_id = str(await self.iroh_node.net().node_id())
 
+        payload = {
+            "capabilities": self.device_capabilities.to_dict(),
+            "topology": self.topology.to_json(),
+        }
+
+        # Include prime-iroh node_id if available
+        if self.prime_iroh_node_id:
+            payload["prime_iroh_node_id"] = self.prime_iroh_node_id
+
         message = {
             "type": "topology_update",
             "sender_id": node_id,
-            "payload": {
-                "capabilities": self.device_capabilities.to_dict(),
-                "topology": self.topology.to_json(),
-            },
+            "payload": payload,
             "timestamp": time.time(),
         }
 

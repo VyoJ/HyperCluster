@@ -162,6 +162,7 @@ dependencies = [
     { name = "accelerate" },
     { name = "iroh" },
     { name = "maturin" },
+    { name = "prime-iroh" },
     { name = "psutil" },
     { name = "py-cpuinfo" },
     { name = "rich" },
@@ -177,6 +178,7 @@ requires-dist = [
     { name = "accelerate", specifier = ">=1.10.1" },
     { name = "iroh", specifier = ">=0.35.0" },
     { name = "maturin", specifier = ">=1.9.6" },
+    { name = "prime-iroh" },
     { name = "psutil", specifier = ">=7.0.0" },
     { name = "py-cpuinfo", specifier = ">=9.0.0" },
     { name = "rich", specifier = ">=14.0.0" },
@@ -526,6 +528,26 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/a1/d4/1fc4078c65507b51b96ca8f8c3ba19e6a61c8253c72794544580a7b6c24d/packaging-25.0.tar.gz", hash = "sha256:d443872c98d677bf60f6a1f2f8c1cb748e8fe762d2bf9d3148b5599295b0fc4f", size = 165727, upload-time = "2025-04-19T11:48:59.673Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/20/12/38679034af332785aac8774540895e234f4d07f7545804097de4b666afd8/packaging-25.0-py3-none-any.whl", hash = "sha256:29572ef2b1f17581046b3a2227d5c611fb25ec70ca1ba8554b24b0e69331a484", size = 66469, upload-time = "2025-04-19T11:48:57.875Z" },
+]
+
+[[package]]
+name = "prime-iroh"
+version = "0.3.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/57/89/9f229ffd4243321ef398fc9338a059e02ec266f8bd3b0b14485a851354b1/prime_iroh-0.3.1.tar.gz", hash = "sha256:5421c9d7e6a86243067fd80e4c94d29983eac2e514c07d8578f5a9ad94f40c3f", size = 63662, upload-time = "2025-06-09T13:56:43.901Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fd/ea/d4bea6f58c526364b702be9d27eed0c9164448a996bfaa59f3ef76ab6217/prime_iroh-0.3.1-cp311-cp311-macosx_10_12_x86_64.whl", hash = "sha256:1a57f1dc0798123905e3cd495ab8aa0b94871b45aa6ab0e8e8d645ec69fdbc93", size = 7354220, upload-time = "2025-06-09T13:58:49.157Z" },
+    { url = "https://files.pythonhosted.org/packages/df/4a/b9b290732028289eea4009aeafd36fb78dab9b55142804388bf21449c85f/prime_iroh-0.3.1-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:57476f193f83ae5e23ffbdade626cf97ae7683e04cb9021c521e27db3abd95c2", size = 7072355, upload-time = "2025-06-09T13:59:39.451Z" },
+    { url = "https://files.pythonhosted.org/packages/ba/88/32d53cd9e6bf3b6266f2c7c6155c97bebfa2f6aab58b9901beb789b536ef/prime_iroh-0.3.1-cp311-cp311-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:f16d71e36cb0adee50ffe3ec817f97603adeaa532de80eaa990133cd125fe03d", size = 8996647, upload-time = "2025-06-09T14:01:18.158Z" },
+    { url = "https://files.pythonhosted.org/packages/7d/fe/a5c941b6f3ae52cdaac9ab01fa4506fc24d0031b22065fad01f784dfc98d/prime_iroh-0.3.1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:dc924f1085ef276f5cbe216e5194b34d11a15072d507fb6ae97b131ad02deb4b", size = 8579014, upload-time = "2025-06-09T14:01:03.622Z" },
+    { url = "https://files.pythonhosted.org/packages/df/e7/c51ebc8d6e70d847f7673359aff5827f5a1c8238f2613cce1a6bc3395031/prime_iroh-0.3.1-cp312-cp312-macosx_10_12_x86_64.whl", hash = "sha256:344cf2819d82db5caa92862c0596e8a26404fa75848a658667525a9a7a4a11ca", size = 7351737, upload-time = "2025-06-09T13:58:51.108Z" },
+    { url = "https://files.pythonhosted.org/packages/b3/6a/8cad0e1d04c0307fd2bb1e021277523702d53c097fb29f54df08afe37677/prime_iroh-0.3.1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:17a76302c98587f3d5b9721efde9d82a572a774fa5c44f9de1b491d1a360a4d3", size = 7070978, upload-time = "2025-06-09T13:59:41.477Z" },
+    { url = "https://files.pythonhosted.org/packages/5f/36/4b1ab173d926ea65cbf850609b7eba7a4d61bde3ea407b9a03162cc4b8cc/prime_iroh-0.3.1-cp312-cp312-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:ad43bc215575e0310513dd70fdaea2105d8b7a8cce5109309c80303cec074654", size = 8997797, upload-time = "2025-06-09T14:01:22.312Z" },
+    { url = "https://files.pythonhosted.org/packages/b3/7b/c4b69e63e8ae399d87ed15ee4e0e0a548c2e65d1d4d8758ba0bb61653b32/prime_iroh-0.3.1-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:cb5312c1b2fba7220e4d178f27f07f5d3ededb0cea55d52c65ac8dd424a25aa0", size = 8580018, upload-time = "2025-06-09T14:01:06.478Z" },
+    { url = "https://files.pythonhosted.org/packages/fc/ed/b11620e86f6055a0bc9cdcf3583b73b2fe4798a48ece60a0cd1164346b36/prime_iroh-0.3.1-cp313-cp313-macosx_10_12_x86_64.whl", hash = "sha256:fd5667d4e13ea0edb635d2b9627581e57b83da41deb72b4e00d130abd5f07fea", size = 7351401, upload-time = "2025-06-09T13:58:53.52Z" },
+    { url = "https://files.pythonhosted.org/packages/db/f1/12b897b252c7d9098d2733f3ccbff2f859586a10a542f47a61b84861ed30/prime_iroh-0.3.1-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:29625ec1c53995b1c103b449fca8c28adb44f44748785d2bf01850ba064738e2", size = 7070937, upload-time = "2025-06-09T13:59:43.571Z" },
+    { url = "https://files.pythonhosted.org/packages/26/43/2075bacd7dfaa11457056b09b200b57844e7a237f4a72f3558c1676da996/prime_iroh-0.3.1-cp313-cp313-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:c3b3788817dba5df00c55c5d84b02197772d05d7f8a614c47d4747883004b0f4", size = 8998052, upload-time = "2025-06-09T14:01:24.593Z" },
+    { url = "https://files.pythonhosted.org/packages/41/36/359e859d14323bab1033b97e206ba632f30311df9ae4103ae4488a46b821/prime_iroh-0.3.1-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:f5df35da5a7975c212b03f1276af1dd124d507abc2214763670605eabd9a2773", size = 8580495, upload-time = "2025-06-09T14:01:08.781Z" },
 ]
 
 [[package]]

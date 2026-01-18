@@ -3,16 +3,15 @@ import logging
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-import typer
-from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
-from typing import List, Optional, Dict, Any
 import iroh
-
+import typer
+from llm_service import LLMMessageType, LLMService
 from node import Node
-from llm_service import LLMService, LLMMessageType
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
 
 console = Console()
 app = typer.Typer()
@@ -29,9 +28,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler(log_filename, encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+        logging.FileHandler(log_filename, encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
 )
 
 # Enable DEBUG for critical message routing components
@@ -83,9 +82,18 @@ async def message_handler(message: dict):
 
             peer_capabilities = DeviceCapabilities.from_dict(peer_capabilities_dict)
             node.topology.update_node(sender_id, peer_capabilities)
-            console.print(
-                f"[dim]Updated topology: {sender_id[:16]}... - {peer_capabilities.memory:.1f} GB[/dim]"
-            )
+
+            # Store prime-iroh peer ID if provided
+            prime_iroh_peer_id = payload.get("prime_iroh_node_id")
+            if prime_iroh_peer_id:
+                node.prime_iroh_peer_ids[sender_id] = prime_iroh_peer_id
+                console.print(
+                    f"[dim]Updated topology: {sender_id[:16]}... - {peer_capabilities.memory:.1f} GB (prime-iroh: {prime_iroh_peer_id[:16]}...)[/dim]"
+                )
+            else:
+                console.print(
+                    f"[dim]Updated topology: {sender_id[:16]}... - {peer_capabilities.memory:.1f} GB[/dim]"
+                )
 
             # Re-initialize ring pipeline if LLM service is running in ring mode
             if llm_service and llm_service.is_running and llm_service.use_ring:
@@ -155,9 +163,7 @@ async def run_node(bootstrap_ticket: Optional[str] = None, use_ring: bool = Fals
     console.print(
         f"[bold green]Node started with ID:[/bold green] [yellow]{await node.iroh_node.net().node_id()}[/yellow]"
     )
-    console.print(
-        f"[dim]📝 Logging to: {log_filename.absolute()}[/dim]"
-    )
+    console.print(f"[dim]📝 Logging to: {log_filename.absolute()}[/dim]")
 
     while True:
         display_command_menu()
