@@ -21,7 +21,7 @@ def _get_cache_seq_length(cache_state) -> int:
     """
     Get sequence length from cache state.
 
-    Supports both DynamicCache objects and tuple-based caches.
+    Supports transformers v4 (key_cache/value_cache lists) and v5 (layers with .keys/.values).
 
     Args:
         cache_state: Either a DynamicCache object or tuple of per-layer caches
@@ -32,13 +32,20 @@ def _get_cache_seq_length(cache_state) -> int:
     if cache_state is None:
         return 0
 
-    # Check if it's a DynamicCache object
+    # Check if it's a Cache object with get_seq_length method (works for both v4 and v5)
     if hasattr(cache_state, "get_seq_length"):
         return cache_state.get_seq_length()
 
-    # Check if it has key_cache attribute (DynamicCache alternative method)
+    # v5 API: Cache has .layers list where each layer has .keys/.values attributes
+    if hasattr(cache_state, "layers") and len(cache_state.layers) > 0:
+        layer = cache_state.layers[0]
+        if hasattr(layer, "keys") and layer.keys is not None and layer.keys.numel() > 0:
+            return layer.keys.shape[-2]
+
+    # v4 API: DynamicCache has key_cache/value_cache lists
     if hasattr(cache_state, "key_cache") and len(cache_state.key_cache) > 0:
-        return cache_state.key_cache[0].shape[2]
+        if cache_state.key_cache[0] is not None:
+            return cache_state.key_cache[0].shape[2]
 
     # Fallback: tuple/list of per-layer caches
     if isinstance(cache_state, (list, tuple)) and len(cache_state) > 0:
@@ -48,6 +55,66 @@ def _get_cache_seq_length(cache_state) -> int:
                 return cache_state[0][0].shape[2]
 
     return 0
+
+
+def _get_cache_num_layers(cache_state) -> int:
+    """
+    Get number of layers in the cache.
+
+    Supports transformers v4 (key_cache list) and v5 (layers list).
+
+    Args:
+        cache_state: A DynamicCache or similar cache object
+
+    Returns:
+        Number of cached layers (0 if no cache)
+    """
+    if cache_state is None:
+        return 0
+
+    # v5 API: Cache has .layers list
+    if hasattr(cache_state, "layers"):
+        return len(cache_state.layers)
+
+    # v4 API: DynamicCache has key_cache list
+    if hasattr(cache_state, "key_cache"):
+        return len(cache_state.key_cache)
+
+    # Fallback for tuple/list caches
+    if hasattr(cache_state, "__len__"):
+        return len(cache_state)
+
+    return 0
+
+
+def _get_cache_layer_key_shape(cache_state, layer_idx: int):
+    """
+    Get the key tensor shape for a specific layer in the cache.
+
+    Supports transformers v4 and v5 cache APIs.
+
+    Args:
+        cache_state: A DynamicCache or similar cache object
+        layer_idx: Index of the layer to get shape for
+
+    Returns:
+        Shape tuple or None if layer doesn't exist
+    """
+    if cache_state is None:
+        return None
+
+    # v5 API: Cache has .layers list with .keys attribute
+    if hasattr(cache_state, "layers") and len(cache_state.layers) > layer_idx:
+        layer = cache_state.layers[layer_idx]
+        if hasattr(layer, "keys") and layer.keys is not None:
+            return layer.keys.shape
+
+    # v4 API: DynamicCache has key_cache list
+    if hasattr(cache_state, "key_cache") and len(cache_state.key_cache) > layer_idx:
+        if cache_state.key_cache[layer_idx] is not None:
+            return cache_state.key_cache[layer_idx].shape
+
+    return None
 
 
 class TransformersShardedInferenceEngine(InferenceEngine):
@@ -272,19 +339,17 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                 logger.info(f"✅ Cache EXISTS for request {request_id}")
                 logger.info(f"   Cache type: {type(cache_state).__name__}")
 
-                # Inspect cache structure
-                if hasattr(cache_state, "key_cache"):
-                    # DynamicCache or similar
-                    num_cached_layers = len(cache_state.key_cache)
+                # Inspect cache structure (compatible with v4 and v5 APIs)
+                num_cached_layers = _get_cache_num_layers(cache_state)
+                if num_cached_layers > 0:
                     logger.info(f"   Number of layers in cache: {num_cached_layers}")
                     logger.info(f"   Sequence length: {past_length}")
 
                     # Show shape of each cached layer
-                    for i, key_tensor in enumerate(
-                        cache_state.key_cache[: min(3, num_cached_layers)]
-                    ):
-                        if key_tensor is not None:
-                            logger.info(f"   Layer {i} key shape: {key_tensor.shape}")
+                    for i in range(min(3, num_cached_layers)):
+                        shape = _get_cache_layer_key_shape(cache_state, i)
+                        if shape is not None:
+                            logger.info(f"   Layer {i} key shape: {shape}")
                     if num_cached_layers > 3:
                         logger.info(f"   ... and {num_cached_layers - 3} more layers")
 
@@ -299,12 +364,6 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                             f"   Expected {expected_layers} layers for my shard OR {self.shard.n_layers} for full model"
                         )
                         logger.warning(f"   Got {num_cached_layers} layers in cache")
-                elif hasattr(cache_state, "__len__"):
-                    num_cached_layers = len(cache_state)
-                    logger.info(
-                        f"   Number of layers in cache (tuple): {num_cached_layers}"
-                    )
-                    logger.info(f"   Sequence length: {past_length}")
                 else:
                     logger.info(f"   Cache object: {cache_state}")
 

@@ -14,3 +14,6 @@ model_cache/
 # Log files
 logs/
 *.log
+
+# Stat files
+stats/

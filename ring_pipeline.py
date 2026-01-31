@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from shard import Shard
 from stats_logger import get_stats_logger
+from transformers_inference import _get_cache_layer_key_shape, _get_cache_num_layers
 
 logger = logging.getLogger(__name__)
 
@@ -336,12 +337,14 @@ class RingPipelineCoordinator:
             logger.info(f"   Request ID: {request_id}")
             if request_id in self.inference_engine.caches:
                 cache = self.inference_engine.caches[request_id]
-                if hasattr(cache, "key_cache"):
-                    logger.info(f"   ✅ Cache exists: {len(cache.key_cache)} layers")
-                    if len(cache.key_cache) > 0 and cache.key_cache[0] is not None:
-                        logger.info("   Cache seq_len: ERROR")
+                num_layers = _get_cache_num_layers(cache)
+                if num_layers > 0:
+                    logger.info(f"   ✅ Cache exists: {num_layers} layers")
+                    shape = _get_cache_layer_key_shape(cache, 0)
+                    if shape is not None:
+                        logger.info(f"   Cache layer 0 key shape: {shape}")
                 else:
-                    logger.info(f"   ✅ Cache exists (tuple): {len(cache)} layers")
+                    logger.info(f"   ✅ Cache exists (empty): {type(cache).__name__}")
             else:
                 logger.info("   ❌ No cache found")
             logger.info("")
@@ -825,14 +828,16 @@ class RingPipelineCoordinator:
                 logger.info("🔍 WORKER NODE CACHE CHECK")
                 if request_id in self.inference_engine.caches:
                     cache = self.inference_engine.caches[request_id]
-                    if hasattr(cache, "key_cache"):
-                        logger.info(
-                            f"   ✅ Cache exists: {len(cache.key_cache)} layers"
-                        )
-                        if len(cache.key_cache) > 0 and cache.key_cache[0] is not None:
-                            logger.info("   Cache seq_len: ERROR")
+                    num_layers = _get_cache_num_layers(cache)
+                    if num_layers > 0:
+                        logger.info(f"   ✅ Cache exists: {num_layers} layers")
+                        shape = _get_cache_layer_key_shape(cache, 0)
+                        if shape is not None:
+                            logger.info(f"   Cache layer 0 key shape: {shape}")
                     else:
-                        logger.info(f"   ✅ Cache exists (tuple): {len(cache)} layers")
+                        logger.info(
+                            f"   ✅ Cache exists (empty): {type(cache).__name__}"
+                        )
                 else:
                     logger.warning("   ⚠️  NO CACHE found on worker node!")
                     logger.warning(

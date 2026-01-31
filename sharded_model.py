@@ -12,6 +12,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from shard import Shard
+
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -425,9 +426,9 @@ class TransformersShard:
             layer_kwargs = {
                 "hidden_states": hidden_states,
                 "attention_mask": attention_mask,
-                # CRITICAL: Qwen3 layer signature expects `past_key_value` (singular)
-                # not `past_key_values` (plural) - see layer forward signature
-                "past_key_value": past_key_value,
+                # CRITICAL FIX: Qwen3DecoderLayer expects `past_key_values` (plural)
+                # The layer will use this cache object to update KV cache in-place
+                "past_key_values": past_key_value,
                 "output_attentions": output_attentions,
                 "use_cache": use_cache,
             }
@@ -442,16 +443,26 @@ class TransformersShard:
 
             # Forward through this layer
             # Different models have different signatures, so we try to be flexible
+
+            # DEBUG: Log shapes for every layer (temporarily enabled for debugging)
+            logger.info(
+                f"   Layer {layer_idx}: hidden_states shape={hidden_states.shape}"
+            )
+            if position_embeddings is not None:
+                logger.info(
+                    f"   Layer {layer_idx}: position_embeddings cos={position_embeddings[0].shape}, sin={position_embeddings[1].shape}"
+                )
+
             if layer_idx == 0:
                 logger.info(f"   Layer {layer_idx} kwargs: {list(layer_kwargs.keys())}")
                 logger.info(
                     f"   🔍 CRITICAL: use_cache value being passed: {layer_kwargs['use_cache']}"
                 )
                 logger.info(
-                    f"   🔍 CRITICAL: past_key_value type: {type(layer_kwargs['past_key_value'])}"
+                    f"   🔍 CRITICAL: past_key_values type: {type(layer_kwargs['past_key_values'])}"
                 )
                 logger.info(
-                    f"   🔍 CRITICAL: past_key_value value: {layer_kwargs['past_key_value']}"
+                    f"   🔍 CRITICAL: past_key_values value: {layer_kwargs['past_key_values']}"
                 )
                 # CRITICAL: Inspect the actual layer forward signature
                 import inspect
@@ -530,6 +541,14 @@ class TransformersShard:
 
                 if output_attentions and len(layer_outputs) > 1:
                     all_self_attns += (layer_outputs[1],)
+            elif isinstance(layer_outputs, torch.Tensor):
+                # CRITICAL FIX: Qwen3DecoderLayer returns a plain tensor, not a tuple!
+                # We should NOT index into it - just use it directly.
+                hidden_states = layer_outputs
+                if layer_idx == 0:
+                    logger.info(
+                        f"   Layer {layer_idx}: Received plain tensor output, using directly"
+                    )
             else:
                 # Some models return objects instead of tuples
                 hidden_states = (
@@ -562,7 +581,9 @@ class TransformersShard:
         # This prevents intermediate nodes from applying LM head when forwarding tensors
         if apply_lm_head is not None:
             is_last = apply_lm_head
-            logger.info(f"🔄 Ring mode: apply_lm_head explicitly set to {apply_lm_head}")
+            logger.info(
+                f"🔄 Ring mode: apply_lm_head explicitly set to {apply_lm_head}"
+            )
         else:
             is_last = self.shard.is_last_layer()
 
