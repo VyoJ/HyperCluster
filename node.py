@@ -80,6 +80,8 @@ class Node:
                     
                     if is_prime_iroh_available():
                         self.prime_iroh_backend = PrimeIrohBackend()
+                        # TODO: For ring pipeline, we should determine send_peer_id and recv_peer_id
+                        # from the ring topology once it's established. For now, initialize without peers.
                         await self.prime_iroh_backend.initialize(str(node_id))
                         logger.info("✨ Prime-iroh backend enabled for optimized tensor transfers")
                     else:

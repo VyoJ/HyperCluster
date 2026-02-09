@@ -76,8 +76,10 @@ Based on the design:
 | Setup Complexity | Simple | Moderate |
 | Small tensors (<10MB) | Fast | Fast |
 | Large tensors (>100MB) | Moderate | **Very Fast** |
-| Latency overhead | ~100-200ms | ~10-50ms |
+| Latency overhead | Higher (sync delays) | Lower (direct streaming) |
 | Best for | General use, testing | Production, large models |
+
+*Note: Performance characteristics are theoretical based on the design. Actual performance may vary based on network conditions and hardware.*
 
 ## Architecture
 
@@ -114,7 +116,7 @@ The integration is controlled by:
 
 ### API Usage
 
-The integration uses prime-iroh's async API:
+The integration uses prime-iroh's async API based on the project's README documentation:
 
 ```python
 # Send tensor
@@ -125,6 +127,8 @@ await send_work.wait()
 recv_work = prime_node.irecv()
 tensor_data = await recv_work.wait()
 ```
+
+**Note**: The current implementation is based on the API described in the prime-iroh README. The actual API may require additional configuration parameters or differ slightly. The implementation includes TODOs for API verification and will be updated once tested with the actual prime-iroh package.
 
 ## Troubleshooting
 
@@ -160,10 +164,25 @@ pip install prime-iroh>=0.3.1
 
 Potential improvements for the integration:
 
-1. **Automatic peer discovery**: Use topology to automatically configure send/receive peers
-2. **Hybrid mode**: Use prime-iroh for large tensors, documents for small messages
-3. **Compression**: Add tensor compression for network-constrained environments
-4. **Metrics**: Add performance metrics comparing both backends
+1. **API Verification**: Test with actual prime-iroh package and adjust implementation to match the real API
+2. **Peer Configuration**: Automatically configure send/receive peers based on ring topology
+3. **Automatic peer discovery**: Use topology to automatically configure send/receive peers
+4. **Hybrid mode**: Use prime-iroh for large tensors, documents for small messages
+5. **Compression**: Add tensor compression for network-constrained environments
+6. **Metrics**: Add performance metrics comparing both backends
+
+## Implementation Status
+
+**Current Status**: Initial integration complete with graceful fallback
+
+- ✅ Dependency added to pyproject.toml
+- ✅ Backend module created with tensor serialization
+- ✅ Integration points added to Node and RingPipeline
+- ✅ CLI flag and documentation added
+- ⚠️ API implementation based on README - needs verification with actual package
+- ⚠️ Peer configuration needs ring topology integration
+- ⏳ Performance testing pending
+- ⏳ End-to-end testing with real prime-iroh package pending
 
 ## References
 

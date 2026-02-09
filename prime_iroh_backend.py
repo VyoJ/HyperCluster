@@ -45,6 +45,9 @@ class PrimeIrohBackend:
             node_id: This node's identifier
             send_peer_id: Peer ID to send data to
             recv_peer_id: Peer ID to receive data from
+        
+        Note: The actual prime-iroh API may differ. This implementation is based on
+        the README documentation and may need adjustments when the package is available.
         """
         try:
             import prime_iroh
@@ -52,7 +55,8 @@ class PrimeIrohBackend:
             logger.info("Initializing prime-iroh backend...")
             
             # Create prime-iroh node
-            # Note: The actual API might differ - this is based on README examples
+            # TODO: Verify actual API - may need configuration parameters
+            # such as bind addresses, secret keys, or other network parameters
             self.prime_node = prime_iroh.Node()
             
             # Configure send and receive peers if provided
@@ -114,7 +118,8 @@ class PrimeIrohBackend:
                 logger.info(f"📤 Prime-iroh sending {size_mb:.2f} MB to {target_peer_id[:16]}...")
                 
                 # Use prime-iroh's isend API (mirroring torch.distributed)
-                # Note: Actual API may differ - adjust based on prime-iroh documentation
+                # TODO: Verify actual API against prime-iroh documentation
+                # The API usage here is based on README examples and may need adjustment
                 send_work = self.prime_node.isend(payload, target_peer_id)
                 await send_work.wait()
                 
@@ -144,6 +149,9 @@ class PrimeIrohBackend:
                 logger.info(f"📥 Prime-iroh waiting to receive tensor...")
                 
                 # Use prime-iroh's irecv API
+                # TODO: Verify if the API supports filtering by peer ID
+                # This may need adjustment for ring topology where we need to
+                # distinguish messages from specific peers
                 recv_work = self.prime_node.irecv()
                 payload = await recv_work.wait()
                 

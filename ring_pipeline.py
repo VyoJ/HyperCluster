@@ -988,12 +988,9 @@ class RingPipelineCoordinator:
             send_time = time.time() - send_start
             if success:
                 logger.info(f"   ✅ Prime-iroh tensor sent in {send_time * 1000:.1f}ms")
+                return success
             else:
                 logger.error("   ❌ Prime-iroh send failed, falling back to document-based")
-                # Fall through to document-based method
-            
-            if success:
-                return success
         
         # Fall back to document-based communication (original implementation)
         # Get document ID for communication
