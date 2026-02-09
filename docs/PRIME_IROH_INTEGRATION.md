@@ -69,7 +69,9 @@ If prime-iroh is not available or fails to initialize:
 
 ## Performance Comparison
 
-Based on the design:
+### Theoretical Performance Characteristics
+
+The following comparison is based on architectural design differences between the two backends:
 
 | Feature | Document-based | Prime-Iroh |
 |---------|---------------|------------|
@@ -79,7 +81,7 @@ Based on the design:
 | Latency overhead | Higher (sync delays) | Lower (direct streaming) |
 | Best for | General use, testing | Production, large models |
 
-*Note: Performance characteristics are theoretical based on the design. Actual performance may vary based on network conditions and hardware.*
+*Note: These are theoretical projections based on design. Actual performance will be measured and documented after testing with the real prime-iroh package.*
 
 ## Architecture
 

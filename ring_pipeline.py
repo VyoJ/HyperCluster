@@ -973,12 +973,15 @@ class RingPipelineCoordinator:
         if self.network.use_prime_iroh and self.network.prime_iroh_backend:
             logger.info("   🚀 Using prime-iroh for optimized transfer")
             
-            # Prepare metadata to send along with tensor
+            # Note: Metadata is currently passed but not transmitted separately
+            # TODO: Implement metadata transmission alongside tensor data
+            # For now, the receiving side will need to reconstruct this from context
             metadata = {
                 "request_id": request_id,
                 "is_final": is_final,
-                "position_ids": position_ids.tolist() if position_ids is not None else None,
-                "attention_mask": attention_mask.tolist() if attention_mask is not None else None,
+                # Avoid converting to list to save memory - these aren't currently sent
+                # "position_ids": position_ids.tolist() if position_ids is not None else None,
+                # "attention_mask": attention_mask.tolist() if attention_mask is not None else None,
             }
             
             success = await self.network.prime_iroh_backend.send_tensor(

@@ -105,7 +105,8 @@ class PrimeIrohBackend:
                 tensor_bytes = data.tobytes()
                 
                 # Prepare header with shape and dtype information
-                shape_bytes = struct.pack(f'{len(data.shape)}i', *data.shape)
+                # Use unsigned integers for dimensions (always non-negative)
+                shape_bytes = struct.pack(f'{len(data.shape)}I', *data.shape)
                 dtype_str = str(data.dtype).encode('utf-8')
                 dtype_len = struct.pack('I', len(dtype_str))
                 
@@ -160,7 +161,8 @@ class PrimeIrohBackend:
                 ndim = struct.unpack('I', payload[offset:offset+4])[0]
                 offset += 4
                 
-                shape = struct.unpack(f'{ndim}i', payload[offset:offset+4*ndim])
+                # Use unsigned integers to match send format
+                shape = struct.unpack(f'{ndim}I', payload[offset:offset+4*ndim])
                 offset += 4 * ndim
                 
                 dtype_len = struct.unpack('I', payload[offset:offset+4])[0]
