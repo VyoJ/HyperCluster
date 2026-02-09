@@ -118,12 +118,12 @@ async def message_handler(message: dict):
             )
 
 
-async def run_node(bootstrap_ticket: Optional[str] = None, use_ring: bool = False):
+async def run_node(bootstrap_ticket: Optional[str] = None, use_ring: bool = False, use_prime_iroh: bool = False):
     global node, llm_service, main_doc_id
 
     iroh.iroh_ffi.uniffi_set_event_loop(asyncio.get_running_loop())
 
-    node = Node()
+    node = Node(use_prime_iroh=use_prime_iroh)
     await node.start()
 
     node.register_message_handler(message_handler)
@@ -151,6 +151,12 @@ async def run_node(bootstrap_ticket: Optional[str] = None, use_ring: bool = Fals
 
     if use_ring:
         console.print("[bold magenta]Ring pipeline mode enabled[/bold magenta]")
+    
+    if use_prime_iroh:
+        if node.use_prime_iroh:
+            console.print("[bold magenta]Prime-iroh optimized tensor transfers enabled[/bold magenta]")
+        else:
+            console.print("[yellow]Prime-iroh requested but not available, using standard mode[/yellow]")
 
     console.print(
         f"[bold green]Node started with ID:[/bold green] [yellow]{await node.iroh_node.net().node_id()}[/yellow]"
@@ -338,9 +344,14 @@ def start(
     use_ring: bool = typer.Option(
         False, "--ring", help="Enable ring pipeline mode for distributed inference"
     ),
+    use_prime_iroh: bool = typer.Option(
+        False, "--prime-iroh", help="Enable prime-iroh for optimized P2P tensor transfers"
+    ),
 ):
     """Start the Hypercluster node."""
     mode_str = "with Ring Pipeline" if use_ring else "Standard"
+    if use_prime_iroh:
+        mode_str += " + Prime-Iroh"
     console.print(
         Panel.fit(
             f"[bold cyan]Hypercluster Node with Iroh ({mode_str})[/bold cyan]\n"
@@ -348,7 +359,7 @@ def start(
             border_style="blue",
         )
     )
-    asyncio.run(run_node(bootstrap_ticket, use_ring))
+    asyncio.run(run_node(bootstrap_ticket, use_ring, use_prime_iroh))
 
 
 if __name__ == "__main__":

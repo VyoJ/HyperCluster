@@ -949,7 +949,7 @@ class RingPipelineCoordinator:
         attention_mask: Optional[np.ndarray] = None,
     ):
         """
-        Send tensor to another node via Iroh blobs.
+        Send tensor to another node via Iroh blobs or prime-iroh.
         Based on prima.cpp's llama_send_tensors().
 
         Prima.cpp sends:
@@ -959,7 +959,43 @@ class RingPipelineCoordinator:
 
         Uses Iroh's blob storage for large binary data (tensor),
         and sends only the blob hash through the document.
+        
+        If prime-iroh is enabled, uses direct P2P streaming instead.
         """
+        send_start = time.time()
+        
+        size_mb = len(data.tobytes()) / 1024 / 1024
+        logger.info(f"   📤 Sending tensor: {size_mb:.2f} MB")
+        logger.info(f"   📤 Target: {target_node_id[:16]}...")
+        logger.info(f"   📤 Request ID: {request_id}")
+        
+        # Try prime-iroh backend if available
+        if self.network.use_prime_iroh and self.network.prime_iroh_backend:
+            logger.info("   🚀 Using prime-iroh for optimized transfer")
+            
+            # Prepare metadata to send along with tensor
+            metadata = {
+                "request_id": request_id,
+                "is_final": is_final,
+                "position_ids": position_ids.tolist() if position_ids is not None else None,
+                "attention_mask": attention_mask.tolist() if attention_mask is not None else None,
+            }
+            
+            success = await self.network.prime_iroh_backend.send_tensor(
+                data, target_node_id, metadata
+            )
+            
+            send_time = time.time() - send_start
+            if success:
+                logger.info(f"   ✅ Prime-iroh tensor sent in {send_time * 1000:.1f}ms")
+            else:
+                logger.error("   ❌ Prime-iroh send failed, falling back to document-based")
+                # Fall through to document-based method
+            
+            if success:
+                return success
+        
+        # Fall back to document-based communication (original implementation)
         # Get document ID for communication
         if not self.network.documents:
             logger.error("No documents available for communication")
@@ -967,14 +1003,8 @@ class RingPipelineCoordinator:
 
         doc_id = next(iter(self.network.documents))
 
-        send_start = time.time()
-
         # Serialize tensor to bytes
         tensor_bytes = data.tobytes()
-        size_mb = len(tensor_bytes) / 1024 / 1024
-        logger.info(f"   📤 Sending tensor: {size_mb:.2f} MB")
-        logger.info(f"   📤 Target: {target_node_id[:16]}...")
-        logger.info(f"   📤 Request ID: {request_id}")
 
         # Store tensor directly in document as a binary entry
         # This ensures it syncs to all peers automatically
