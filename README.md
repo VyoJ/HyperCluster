@@ -8,6 +8,7 @@
 *   **P2P Networking**: Decentralized architecture using Iroh, allowing for dynamic node discovery and communication.
 *   **Dynamic Sharding**: Automatically partitions model layers based on the available memory and compute capabilities of each node.
 *   **Ring Pipeline Architecture**: Implements a high-performance ring topology (inspired by `prima.cpp`) for pipelined inference, optimizing throughput.
+*   **Prime-Iroh Integration**: Optional high-performance P2P communication backend for optimized tensor transfers (see [Prime-Iroh Integration](docs/PRIME_IROH_INTEGRATION.md)).
 *   **Fault Tolerance**: Handles node failures and topology changes dynamically.
 *   **Interactive REPL**: Built-in command-line interface for managing the cluster and running queries.
 
@@ -49,6 +50,12 @@ Run the following command on your primary machine. This will create a new networ
 python main.py start --ring
 ```
 
+**For optimized performance with large models**, add the `--prime-iroh` flag:
+
+```bash
+python main.py start --ring --prime-iroh
+```
+
 **Output:**
 ```text
 Created main document. Share this ticket:
@@ -63,9 +70,12 @@ On your other devices (workers), run the start command with the `--bootstrap-tic
 ```bash
 # Replace <TICKET> with the string copied from the first node
 python main.py start --bootstrap-ticket "docaaac..."
+
+# With prime-iroh for optimized tensor transfers
+python main.py start --bootstrap-ticket "docaaac..." --prime-iroh
 ```
 
-*Note: Ensure all nodes use the same mode (Standard or Ring) for best compatibility.*
+*Note: Ensure all nodes use the same mode (Standard or Ring) and same communication backend (with or without --prime-iroh) for best compatibility.*
 
 ### 3. Verify Connectivity
 
@@ -114,6 +124,7 @@ The REPL supports several other utility commands:
 
 Detailed documentation for specific components can be found in the `docs/` directory:
 
+*   [**Prime-Iroh Integration**](docs/PRIME_IROH_INTEGRATION.md): Guide to using prime-iroh for optimized P2P tensor transfers.
 *   [**Sharded Inference Guide**](docs/Sharded_Inference.md): Deep dive into how sharding works.
 *   [**Troubleshooting**](docs/Troubleshooting.md): Common issues and fixes.
 

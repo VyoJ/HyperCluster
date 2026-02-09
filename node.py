@@ -24,6 +24,7 @@ class Node:
         self,
         bootstrap_nodes: Optional[List[str]] = None,
         partitioning_strategy: Optional[PartitioningStrategy] = None,
+        use_prime_iroh: bool = False,
     ):
         self.iroh_node: Optional[Iroh] = None
         self.bootstrap_nodes = bootstrap_nodes or []
@@ -51,6 +52,10 @@ class Node:
 
         # Cache for binary tensor data (hash -> content)
         self.tensor_cache: Dict[str, bytes] = {}  # hash_str -> binary_content
+        
+        # Prime-iroh backend (optional, for optimized tensor transfers)
+        self.use_prime_iroh = use_prime_iroh
+        self.prime_iroh_backend = None
 
     async def start(self):
         """Start the Iroh node."""
@@ -67,6 +72,24 @@ class Node:
 
             # Initialize topology with this node
             await self.update_topology()
+            
+            # Initialize prime-iroh backend if enabled
+            if self.use_prime_iroh:
+                try:
+                    from prime_iroh_backend import PrimeIrohBackend, is_prime_iroh_available
+                    
+                    if is_prime_iroh_available():
+                        self.prime_iroh_backend = PrimeIrohBackend()
+                        # TODO: For ring pipeline, we should determine send_peer_id and recv_peer_id
+                        # from the ring topology once it's established. For now, initialize without peers.
+                        await self.prime_iroh_backend.initialize(str(node_id))
+                        logger.info("✨ Prime-iroh backend enabled for optimized tensor transfers")
+                    else:
+                        logger.warning("Prime-iroh requested but not available, falling back to document-based communication")
+                        self.use_prime_iroh = False
+                except Exception as e:
+                    logger.warning(f"Failed to initialize prime-iroh backend: {e}, falling back to document-based communication")
+                    self.use_prime_iroh = False
 
         except Exception as e:
             logger.error(f"Failed to start Iroh node: {e}")
@@ -74,6 +97,10 @@ class Node:
 
     async def stop(self):
         """Stop the Iroh node."""
+        # Shutdown prime-iroh backend if active
+        if self.prime_iroh_backend:
+            await self.prime_iroh_backend.shutdown()
+            
         if self.iroh_node:
             await self.iroh_node.node().shutdown()
             logger.info("Iroh node stopped.")
