@@ -101,10 +101,16 @@ class TensorForwardService(RpcServiceHandler):
             tensor_data = np.frombuffer(tensor_bytes, dtype=tensor_dtype).reshape(tensor_shape)
 
             # Extract position_ids and attention_mask (critical for RoPE)
+            # Support compact position format: integer for single positions
             position_ids = None
             attention_mask = None
-            if metadata.get("position_ids") is not None:
-                position_ids = np.array(metadata["position_ids"], dtype=np.int64)
+            raw_pos = metadata.get("position_ids")
+            if raw_pos is not None:
+                if isinstance(raw_pos, int):
+                    # Compact format: single integer → [[N]]
+                    position_ids = np.array([[raw_pos]], dtype=np.int64)
+                else:
+                    position_ids = np.array(raw_pos, dtype=np.int64)
             if metadata.get("attention_mask") is not None:
                 attention_mask = np.array(metadata["attention_mask"], dtype=np.bool_)
 

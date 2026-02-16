@@ -192,6 +192,11 @@ class RingPipelineCoordinator:
             )
         logger.info("=" * 80)
 
+        # Pre-warm QUIC connections to ring neighbors
+        # This eliminates the 6-20ms connection setup latency on the first tensor send
+        if world_size > 1 and self.network.conn_manager and self.network.use_direct_transport:
+            await self._prewarm_connections()
+
         # Start prefetch worker
         if self.prefetch_task is None:
             self.prefetch_task = asyncio.create_task(self._prefetch_worker())
@@ -245,6 +250,42 @@ class RingPipelineCoordinator:
             current_layer += num_layers
 
         return windows
+
+    async def _prewarm_connections(self):
+        """
+        Pre-warm QUIC connections to ring neighbors during initialization.
+
+        This eliminates the ~6-20ms connection setup + handshake latency
+        that would otherwise occur on the first tensor send of each generation.
+        """
+        if not self.ring_position:
+            return
+
+        neighbors = set()
+        if self.ring_position.next_node_id:
+            neighbors.add(self.ring_position.next_node_id)
+        if self.ring_position.prev_node_id:
+            neighbors.add(self.ring_position.prev_node_id)
+        # Also pre-warm connection to head (for tail→head sampled token return)
+        head_id = self._find_head_node_id()
+        if head_id:
+            neighbors.add(head_id)
+
+        my_node_id = str(await self.network.iroh_node.net().node_id())
+        neighbors.discard(my_node_id)  # Don't connect to self
+
+        for peer_id in neighbors:
+            try:
+                handle = await self.network.conn_manager.connect(peer_id)
+                rtt = await handle.ping(timeout=5.0)
+                logger.info(
+                    f"🔥 Pre-warmed QUIC connection to {peer_id[:16]}... "
+                    f"(RTT: {rtt:.1f}ms)"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"⚠️  Failed to pre-warm connection to {peer_id[:16]}...: {e}"
+                )
 
     def this_layer_is_mine(self, layer_id: int) -> bool:
         """
@@ -341,8 +382,16 @@ class RingPipelineCoordinator:
                 cache = self.inference_engine.caches[request_id]
                 if hasattr(cache, "key_cache"):
                     logger.debug(f"   ✅ Cache exists: {len(cache.key_cache)} layers")
-                    if len(cache.key_cache) > 0 and cache.key_cache[0] is not None:
-                        logger.debug("   Cache seq_len: ERROR")
+                    try:
+                        if hasattr(cache, "get_seq_length"):
+                            seq_len = cache.get_seq_length(0)
+                            logger.debug(f"   Cache seq_len: {seq_len}")
+                        elif len(cache.key_cache) > 0 and cache.key_cache[0] is not None:
+                            logger.debug(f"   Cache seq_len: {cache.key_cache[0].shape[-2]}")
+                        else:
+                            logger.debug("   Cache seq_len: (empty)")
+                    except Exception as e:
+                        logger.debug(f"   Cache seq_len: ERROR ({e})")
                 else:
                     logger.debug(f"   ✅ Cache exists (tuple): {len(cache)} layers")
             else:
@@ -372,24 +421,33 @@ class RingPipelineCoordinator:
                 else None  # For prompt pass, use positions [0, 1, 2, ..., len-1]
             )
 
-            logits = await self._ring_forward_pass(
+            result = await self._ring_forward_pass(
                 request_id=request_id,
                 input_data=input_tokens,
                 shard=shard,
                 initial_position=current_position,  # Pass actual token position!
             )
 
-            if logits is None:
+            if result is None:
                 logger.warning(
                     "⚠️  Ring forward pass returned None, stopping generation"
                 )
                 break
 
-            # Sample next token
-            next_token = await self.inference_engine.sample(
-                logits, temp=0.7
-            )  # Use temperature sampling for better diversity
-            token_id = int(next_token[0])
+            # Check if result is a pre-sampled token (from tail-node sampling)
+            # or full logits that need sampling here on head
+            if result.dtype in (np.int64, np.int32) and result.size == 1:
+                # Pre-sampled token from tail node — skip sampling
+                token_id = int(result.flat[0])
+                next_token = np.array([token_id], dtype=np.int64)
+                logger.debug(f"   🎯 Using pre-sampled token from tail node: {token_id}")
+            else:
+                # Full logits — sample here on head
+                next_token = await self.inference_engine.sample(
+                    result, temp=0.7
+                )
+                token_id = int(next_token[0])
+
             generated_tokens.append(token_id)
 
             step_time = time.time() - step_start
@@ -741,15 +799,22 @@ class RingPipelineCoordinator:
                 logger.debug("   ✅ HEAD node: Returning logits for sampling")
                 return current_data
             else:
-                # Send back to head
-                logger.debug(f"   📤 Worker node: Sending {data_type} back to HEAD")
-                await self._send_to_node(
-                    target_node_id=self._find_head_node_id(),
-                    data=current_data,
+                # OPTIMIZATION: Sample token on tail node instead of sending full logits
+                # This reduces transfer from ~0.58MB (logits) to ~32 bytes (token ID)
+                # per autoregressive step — a ~18,000x reduction in data transfer
+                logger.debug("   🎯 TAIL-NODE SAMPLING: Sampling token locally instead of sending logits")
+                sample_start = time.time()
+                sampled_token = await self.inference_engine.sample(
+                    current_data, temp=0.7
+                )
+                token_id = int(sampled_token[0])
+                sample_time = time.time() - sample_start
+                logger.debug(f"   ✅ Sampled token {token_id} in {sample_time*1000:.1f}ms")
+
+                # Send just the token ID back to head (tiny payload)
+                await self._send_sampled_token_to_head(
                     request_id=request_id,
-                    is_final=True,
-                    position_ids=state.position_ids,
-                    attention_mask=state.attention_mask,
+                    token_id=token_id,
                 )
                 return None
         else:
@@ -826,8 +891,16 @@ class RingPipelineCoordinator:
                         logger.debug(
                             f"   ✅ Cache exists: {len(cache.key_cache)} layers"
                         )
-                        if len(cache.key_cache) > 0 and cache.key_cache[0] is not None:
-                            logger.debug("   Cache seq_len: ERROR")
+                        try:
+                            if hasattr(cache, "get_seq_length"):
+                                seq_len = cache.get_seq_length(0)
+                                logger.debug(f"   Cache seq_len: {seq_len}")
+                            elif len(cache.key_cache) > 0 and cache.key_cache[0] is not None:
+                                logger.debug(f"   Cache seq_len: {cache.key_cache[0].shape[-2]}")
+                            else:
+                                logger.debug("   Cache seq_len: (empty)")
+                        except Exception as e:
+                            logger.debug(f"   Cache seq_len: ERROR ({e})")
                     else:
                         logger.debug(f"   ✅ Cache exists (tuple): {len(cache)} layers")
                 else:
@@ -919,7 +992,7 @@ class RingPipelineCoordinator:
             if is_final and self.ring_position and self.ring_position.is_head:
                 # Final result received at head
                 # CRITICAL: Store result and signal completion to waiting loop
-                state.final_result = tensor_data  # Store the logits
+                state.final_result = tensor_data  # Store the logits or sampled token
                 state.current_layer = shard.n_layers  # Mark all layers complete
                 logger.debug("   ✅ Final result received at HEAD, stored in state")
                 # Signal instant wakeup (no more 100ms polling delay)
@@ -934,6 +1007,52 @@ class RingPipelineCoordinator:
 
         except Exception as e:
             logger.error(f"Error in handle_incoming_tensor: {e}", exc_info=True)
+
+    async def _send_sampled_token_to_head(
+        self,
+        request_id: str,
+        token_id: int,
+    ):
+        """
+        Send a sampled token ID back to the head node.
+
+        This is the optimized return path: instead of sending full logits
+        (0.58MB per step), we send just the token ID (32 bytes).
+        The head node receives this as a 1-element int64 numpy array
+        with is_final=True, and uses it directly for the generation loop.
+        """
+        head_node_id = self._find_head_node_id()
+        # Encode token as a tiny numpy array so the existing tensor pathway works
+        token_data = np.array([[token_id]], dtype=np.int64)
+
+        send_start = time.time()
+        logger.debug(f"   📤 Sending sampled token {token_id} to HEAD ({head_node_id[:16]}...)")
+
+        my_node_id = str(await self.network.iroh_node.net().node_id())
+        metadata = {
+            "sender_id": my_node_id,
+            "request_id": request_id,
+            "tensor_shape": list(token_data.shape),
+            "tensor_dtype": str(token_data.dtype),
+            "is_final": True,
+            "is_sampled_token": True,  # Signal that this is a pre-sampled token
+            "token_id": token_id,
+            "position_ids": None,
+            "attention_mask": None,
+        }
+
+        await self.network.send_tensor_direct(
+            target_node_id=head_node_id,
+            tensor_data=token_data,
+            request_id=request_id,
+            metadata=metadata,
+        )
+
+        send_time = time.time() - send_start
+        logger.debug(
+            f"   ✅ Sampled token sent in {send_time * 1000:.1f}ms "
+            f"(8 bytes vs ~0.58MB logits)"
+        )
 
     async def _send_to_node(
         self,
@@ -965,15 +1084,23 @@ class RingPipelineCoordinator:
 
         # Build metadata (like prima.cpp's sync_meta)
         my_node_id = str(await self.network.iroh_node.net().node_id())
+
+        # OPTIMIZATION: Send position as compact integer instead of full arrays
+        # Position_ids is typically [[N]] for autoregressive steps — just send N
+        compact_position = None
+        if position_ids is not None:
+            if position_ids.size == 1:
+                compact_position = int(position_ids.flat[0])
+            else:
+                compact_position = position_ids.tolist()
+
         metadata = {
             "sender_id": my_node_id,
             "request_id": request_id,
             "tensor_shape": list(data.shape),
             "tensor_dtype": str(data.dtype),
             "is_final": is_final,
-            "position_ids": position_ids.tolist()
-            if position_ids is not None
-            else None,
+            "position_ids": compact_position,
             "attention_mask": attention_mask.tolist()
             if attention_mask is not None
             else None,

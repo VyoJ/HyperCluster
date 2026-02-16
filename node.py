@@ -680,14 +680,18 @@ class Node:
             logger.info(f"   Is final: {is_final}")
 
             # Extract position_ids and attention_mask from payload (CRITICAL!)
-            position_ids_list = payload.get("position_ids")
+            # Support compact position format: integer for single positions
+            position_ids_raw = payload.get("position_ids")
             attention_mask_list = payload.get("attention_mask")
 
-            position_ids = (
-                np.array(position_ids_list, dtype=np.int64)
-                if position_ids_list is not None
-                else None
-            )
+            position_ids = None
+            if position_ids_raw is not None:
+                if isinstance(position_ids_raw, int):
+                    # Compact format: single integer → [[N]]
+                    position_ids = np.array([[position_ids_raw]], dtype=np.int64)
+                else:
+                    position_ids = np.array(position_ids_raw, dtype=np.int64)
+
             attention_mask = (
                 np.array(attention_mask_list, dtype=np.bool_)
                 if attention_mask_list is not None

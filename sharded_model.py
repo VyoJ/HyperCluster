@@ -81,6 +81,24 @@ class TransformersShard:
         # Extract components based on model architecture
         self._extract_model_components()
 
+        # CRITICAL FIX: Override num_hidden_layers in config to match this shard.
+        # Without this, DynamicCache (and other transformers internals) pre-allocate
+        # 28 slots based on config.num_hidden_layers, even though we only have 10
+        # layers. This causes len(cache.key_cache) == 28 instead of 10, and
+        # get_seq_length(0) returns 0 for empty padding slots → broken cache_position.
+        import copy
+        self.config = copy.deepcopy(base_model.config)
+        shard_layer_count = self.end_layer - self.start_layer + 1
+        if hasattr(self.config, "num_hidden_layers"):
+            self.config.num_hidden_layers = shard_layer_count
+        elif hasattr(self.config, "n_layer"):
+            self.config.n_layer = shard_layer_count
+        elif hasattr(self.config, "num_layers"):
+            self.config.num_layers = shard_layer_count
+        logger.info(
+            f"Patched config: num_hidden_layers={shard_layer_count} (was {self.total_layers})"
+        )
+
         logger.info(
             f"Initialized {self.model_type} shard with layers {self.start_layer}-{self.end_layer}/{self.total_layers}"
         )
