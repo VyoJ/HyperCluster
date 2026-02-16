@@ -291,17 +291,17 @@ class RingPipelineCoordinator:
         if not self.ring_position or not self.ring_position.is_head:
             raise ValueError("Only head node can start inference")
 
-        logger.debug("=" * 80)
+        logger.info("=" * 80)
         logger.info("🚀 STARTING RING INFERENCE")
-        logger.debug("=" * 80)
-        logger.debug(f"Request ID: {request_id}")
-        logger.debug(f"Prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}")
-        logger.debug(f"Max tokens: {max_tokens}")
-        logger.debug(f"Model layers: {shard.n_layers}")
+        logger.info("=" * 80)
+        logger.info(f"Request ID: {request_id}")
+        logger.info(f"Prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}")
+        logger.info(f"Max tokens: {max_tokens}")
+        logger.info(f"Model layers: {shard.n_layers}")
 
         # Clear any existing cache for this request
         # This ensures we start with clean state for new prompts
-        logger.debug(f"Clearing any existing cache for request {request_id}")
+        logger.info(f"Clearing any existing cache for request {request_id}")
         self.inference_engine.caches.pop(request_id, None)
 
         # Get stats logger
@@ -315,12 +315,12 @@ class RingPipelineCoordinator:
         encode_time = time.time() - start_time
         stats_logger.log_encoding_end(request_id, len(tokens))
 
-        logger.debug("")
+        logger.info("")
         logger.info("📝 Encoding complete:")
-        logger.debug(f"   Input tokens: {len(tokens)}")
+        logger.info(f"   Input tokens: {len(tokens)}")
         logger.info(f"   Token shape: {input_tokens.shape}")
-        logger.debug(f"   Encode time: {encode_time * 1000:.1f}ms")
-        logger.debug("=" * 80)
+        logger.info(f"   Encode time: {encode_time * 1000:.1f}ms")
+        logger.info("=" * 80)
 
         generated_tokens = []
 
@@ -329,25 +329,25 @@ class RingPipelineCoordinator:
 
         # Auto-regressive generation loop
         for step in range(max_tokens):
-            logger.debug("")
-            logger.debug(f"🔄 GENERATION STEP {step + 1}/{max_tokens}")
+            logger.info("")
+            logger.info(f"🔄 GENERATION STEP {step + 1}/{max_tokens}")
             logger.info(f"   Tokens generated so far: {len(generated_tokens)}")
 
             # 🐛 DEBUG: Check cache state before generation step
-            logger.debug("")
-            logger.debug("🔍 PRE-STEP CACHE CHECK")
-            logger.debug(f"   Request ID: {request_id}")
+            logger.info("")
+            logger.info("🔍 PRE-STEP CACHE CHECK")
+            logger.info(f"   Request ID: {request_id}")
             if request_id in self.inference_engine.caches:
                 cache = self.inference_engine.caches[request_id]
                 if hasattr(cache, "key_cache"):
-                    logger.debug(f"   ✅ Cache exists: {len(cache.key_cache)} layers")
+                    logger.info(f"   ✅ Cache exists: {len(cache.key_cache)} layers")
                     if len(cache.key_cache) > 0 and cache.key_cache[0] is not None:
-                        logger.debug("   Cache seq_len: ERROR")
+                        logger.info("   Cache seq_len: ERROR")
                 else:
-                    logger.debug(f"   ✅ Cache exists (tuple): {len(cache)} layers")
+                    logger.info(f"   ✅ Cache exists (tuple): {len(cache)} layers")
             else:
-                logger.debug("   ❌ No cache found")
-            logger.debug("")
+                logger.info("   ❌ No cache found")
+            logger.info("")
 
             step_start = time.time()
 
@@ -400,7 +400,7 @@ class RingPipelineCoordinator:
             stats_logger.log_generation_step(request_id, step_time * 1000)
 
             logger.info(f"   ✅ Token {step + 1} sampled: {token_id}")
-            logger.debug(f"   ⏱️  Step time: {step_time * 1000:.1f}ms")
+            logger.info(f"   ⏱️  Step time: {step_time * 1000:.1f}ms")
 
             # Show decoded text every 10 tokens
             if (step + 1) % 10 == 0 or step == 0:
@@ -408,7 +408,7 @@ class RingPipelineCoordinator:
                     decoded_so_far = await self.inference_engine.decode(
                         shard, np.array(generated_tokens)
                     )
-                    logger.debug(
+                    logger.info(
                         f"   📝 Text so far: {decoded_so_far[:100]}{'...' if len(decoded_so_far) > 100 else ''}"
                     )
                 except Exception as e:
@@ -428,7 +428,7 @@ class RingPipelineCoordinator:
                     eos_tokens.add(additional_eos)
 
             if token_id in eos_tokens:
-                logger.debug(
+                logger.info(
                     f"   🛑 EOS token ({token_id}) detected, stopping generation"
                 )
                 break
@@ -450,20 +450,20 @@ class RingPipelineCoordinator:
             logger.error(f"Error decoding tokens: {e}")
             decoded_text = f"[Error decoding: {e}]"
 
-        logger.debug("=" * 80)
+        logger.info("=" * 80)
         logger.info("✨ GENERATION COMPLETE")
         logger.info(f"   Total tokens: {len(generated_tokens)}")
         logger.info(f"   Total time: {total_time:.2f}s")
-        logger.debug(
+        logger.info(
             f"   Avg token latency: {total_time / max(len(generated_tokens), 1) * 1000:.1f}ms/token"
         )
-        logger.debug("=" * 80)
-        logger.debug("")
+        logger.info("=" * 80)
+        logger.info("")
         logger.info("📄 GENERATED TEXT:")
-        logger.debug(f"{'─' * 80}")
-        logger.debug(f"{decoded_text}")
-        logger.debug(f"{'─' * 80}")
-        logger.debug("")
+        logger.info(f"{'─' * 80}")
+        logger.info(f"{decoded_text}")
+        logger.info(f"{'─' * 80}")
+        logger.info("")
 
         return generated_tokens
 
@@ -494,11 +494,11 @@ class RingPipelineCoordinator:
         """
         total_cycles = self.calculate_cycles_needed(shard.n_layers)
 
-        logger.debug("")
-        logger.debug("🔁 Ring Forward Pass")
-        logger.debug(f"   Input shape: {input_data.shape}")
-        logger.debug(f"   Total cycles needed: {total_cycles}")
-        logger.debug(f"   Total layers: {shard.n_layers}")
+        logger.info("")
+        logger.info("🔁 Ring Forward Pass")
+        logger.info(f"   Input shape: {input_data.shape}")
+        logger.info(f"   Total cycles needed: {total_cycles}")
+        logger.info(f"   Total layers: {shard.n_layers}")
 
         # Initialize position_ids for the first node
         # This is critical - like prima.cpp's inp_pos
@@ -511,19 +511,19 @@ class RingPipelineCoordinator:
             # For autoregressive generation: single token at specific position
             # Example: if initial_position=256, position_ids = [256]
             position_ids = np.array([[initial_position]], dtype=np.int64)
-            logger.debug(f"   Using provided initial_position: {initial_position}")
+            logger.info(f"   Using provided initial_position: {initial_position}")
         else:
             # For initial prompt: sequence of positions [0, 1, 2, ..., seq_len-1]
             position_ids = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
             position_ids = np.broadcast_to(position_ids, (batch_size, seq_len))
-            logger.debug(f"   Created position_ids for prompt: [0..{seq_len - 1}]")
+            logger.info(f"   Created position_ids for prompt: [0..{seq_len - 1}]")
 
         # Create attention mask: all ones (attend to all tokens)
         attention_mask = np.ones((batch_size, seq_len), dtype=np.bool_)
 
-        logger.debug(f"   Initialized position_ids shape: {position_ids.shape}")
-        logger.debug(f"   Position_ids content: {position_ids}")
-        logger.debug(f"   Initialized attention_mask shape: {attention_mask.shape}")
+        logger.info(f"   Initialized position_ids shape: {position_ids.shape}")
+        logger.info(f"   Position_ids content: {position_ids}")
+        logger.info(f"   Initialized attention_mask shape: {attention_mask.shape}")
 
         # Initialize state
         state = InferenceState(
@@ -543,12 +543,12 @@ class RingPipelineCoordinator:
         self.active_requests[request_id] = state
 
         # Head node starts the ring
-        logger.debug("   🎯 Initiating ring from HEAD node...")
+        logger.info("   🎯 Initiating ring from HEAD node...")
         result = await self._process_and_forward(request_id, state, shard)
 
         # SPECIAL CASE: Single node mode - result is returned directly
         if self.ring_position and self.ring_position.world_size == 1:
-            logger.debug(
+            logger.info(
                 "   ✅ Single node mode: got result directly, no waiting needed"
             )
             self.active_requests.pop(request_id, None)
@@ -565,7 +565,7 @@ class RingPipelineCoordinator:
         try:
             await asyncio.wait_for(event.wait(), timeout=timeout)
             elapsed = time.time() - start_time
-            logger.debug(f"   ✅ All layers processed in {elapsed * 1000:.1f}ms")
+            logger.info(f"   ✅ All layers processed in {elapsed * 1000:.1f}ms")
         except asyncio.TimeoutError:
             logger.error(
                 f"   ⚠️  Timeout waiting for ring completion! State: layer={state.current_layer}/{shard.n_layers}"
@@ -616,20 +616,20 @@ class RingPipelineCoordinator:
                 break
 
         if layers_to_process:
-            logger.debug("")
-            logger.debug(
+            logger.info("")
+            logger.info(
                 f"⚙️  Processing on Rank {self.ring_position.rank if self.ring_position else '?'}"
             )
-            logger.debug(
+            logger.info(
                 f"   Global layer IDs: {layers_to_process[0]} → {layers_to_process[-1]} ({len(layers_to_process)} layers)"
             )
-            logger.debug(
+            logger.info(
                 f"   My layer window: {self.layer_window.layer_start} → {self.layer_window.layer_end}"
             )
-            logger.debug(
+            logger.info(
                 f"   Current global progress: {state.current_layer}/{shard.n_layers}"
             )
-            logger.debug(f"   Input shape: {current_data.shape}")
+            logger.info(f"   Input shape: {current_data.shape}")
 
             compute_start = time.time()
 
@@ -665,14 +665,14 @@ class RingPipelineCoordinator:
             # Apply LM head ONLY if we're completing all layers AND we're the designated last node
             apply_lm_head = will_complete_all_layers and is_last_node_in_ring
 
-            logger.debug("   🎯 LM head decision:")
-            logger.debug(
+            logger.info("   🎯 LM head decision:")
+            logger.info(
                 f"      - Will complete all layers: {will_complete_all_layers} (processing up to layer {layers_to_process[-1]})"
             )
-            logger.debug(
+            logger.info(
                 f"      - Is last node in ring: {is_last_node_in_ring} (layer_end={self.layer_window.layer_end if self.layer_window else '?'}, total={shard.n_layers})"
             )
-            logger.debug(f"      - Apply LM head: {apply_lm_head}")
+            logger.info(f"      - Apply LM head: {apply_lm_head}")
 
             # Run inference on assigned layers using the already-loaded sharded model
             output_data, new_state = await self.inference_engine.infer_tensor(
@@ -695,20 +695,20 @@ class RingPipelineCoordinator:
             # Prima.cpp does this implicitly in its layer loop
             state.current_layer = layers_to_process[-1] + 1
 
-            logger.debug(f"   Output shape: {output_data.shape}")
-            logger.debug(f"   ⏱️  Compute time: {compute_time * 1000:.1f}ms")
-            logger.debug(
+            logger.info(f"   Output shape: {output_data.shape}")
+            logger.info(f"   ⏱️  Compute time: {compute_time * 1000:.1f}ms")
+            logger.info(
                 f"   Updated global progress: {state.current_layer}/{shard.n_layers}"
             )
-            logger.debug(f"   Layers remaining: {shard.n_layers - state.current_layer}")
+            logger.info(f"   Layers remaining: {shard.n_layers - state.current_layer}")
 
             # Log output type for debugging
             if output_data.shape[-1] == shard.n_layers:  # Assuming vocab size check
-                logger.debug(
+                logger.info(
                     f"   📊 Output type: LOGITS (vocab_size={output_data.shape[-1]})"
                 )
             else:
-                logger.debug(
+                logger.info(
                     f"   📊 Output type: HIDDEN STATES (hidden_size={output_data.shape[-1]})"
                 )
         else:
@@ -723,26 +723,26 @@ class RingPipelineCoordinator:
         is_final_layer = state.current_layer >= shard.n_layers
 
         if is_final_layer:
-            logger.debug("   🏁 Final layer reached!")
+            logger.info("   🏁 Final layer reached!")
 
             # Determine what type of data we're sending
             data_type = "LOGITS" if current_data.shape[-1] > 10000 else "HIDDEN STATES"
-            logger.debug(f"   📊 Data type: {data_type} (shape={current_data.shape})")
+            logger.info(f"   📊 Data type: {data_type} (shape={current_data.shape})")
 
             # SPECIAL CASE: Single node - return logits directly
             if self.ring_position and self.ring_position.world_size == 1:
-                logger.debug(
+                logger.info(
                     "   ✅ Single node mode: Returning logits directly for sampling"
                 )
                 return current_data
 
             # Return logits (head node only)
             if self.ring_position and self.ring_position.is_head:
-                logger.debug("   ✅ HEAD node: Returning logits for sampling")
+                logger.info("   ✅ HEAD node: Returning logits for sampling")
                 return current_data
             else:
                 # Send back to head
-                logger.debug(f"   📤 Worker node: Sending {data_type} back to HEAD")
+                logger.info(f"   📤 Worker node: Sending {data_type} back to HEAD")
                 await self._send_to_node(
                     target_node_id=self._find_head_node_id(),
                     data=current_data,
@@ -759,12 +759,12 @@ class RingPipelineCoordinator:
 
             # SPECIAL CASE: Single node - don't send to network, just continue processing
             if self.ring_position.world_size == 1:
-                logger.debug("   ↻ Single node mode: continuing to next layers locally")
+                logger.info("   ↻ Single node mode: continuing to next layers locally")
                 # Continue processing remaining layers
                 return await self._process_and_forward(request_id, state, shard)
 
             next_rank = (self.ring_position.rank + 1) % self.ring_position.world_size
-            logger.debug(
+            logger.info(
                 f"   📤 Forwarding to Rank {next_rank} ({self.ring_position.next_node_id[:16]}...)"
             )
 
@@ -798,38 +798,38 @@ class RingPipelineCoordinator:
         Without position_ids, RoPE embeddings fail and attention is broken.
         """
         try:
-            logger.debug("")
-            logger.debug("📥 RECEIVED TENSOR IN RING COORDINATOR")
-            logger.debug(f"   From: {sender_id[:16]}...")
-            logger.debug(f"   Request: {request_id}")
-            logger.debug(f"   Shape: {tensor_data.shape}")
-            logger.debug(f"   Is final: {is_final}")
-            logger.debug(
+            logger.info("")
+            logger.info("📥 RECEIVED TENSOR IN RING COORDINATOR")
+            logger.info(f"   From: {sender_id[:16]}...")
+            logger.info(f"   Request: {request_id}")
+            logger.info(f"   Shape: {tensor_data.shape}")
+            logger.info(f"   Is final: {is_final}")
+            logger.info(
                 f"   My rank: {self.ring_position.rank if self.ring_position else '?'}"
             )
-            logger.debug(f"   Has position_ids: {position_ids is not None}")
-            logger.debug(f"   Has attention_mask: {attention_mask is not None}")
+            logger.info(f"   Has position_ids: {position_ids is not None}")
+            logger.info(f"   Has attention_mask: {attention_mask is not None}")
 
             # Restore or create state
             if request_id in self.active_requests:
                 state = self.active_requests[request_id]
-                logger.debug(
+                logger.info(
                     f"   Restored existing state (layer {state.current_layer}, step {state.generation_step})"
                 )
 
                 # 🐛 DEBUG: Check if we have cache for this request
-                logger.debug("")
-                logger.debug("🔍 WORKER NODE CACHE CHECK")
+                logger.info("")
+                logger.info("🔍 WORKER NODE CACHE CHECK")
                 if request_id in self.inference_engine.caches:
                     cache = self.inference_engine.caches[request_id]
                     if hasattr(cache, "key_cache"):
-                        logger.debug(
+                        logger.info(
                             f"   ✅ Cache exists: {len(cache.key_cache)} layers"
                         )
                         if len(cache.key_cache) > 0 and cache.key_cache[0] is not None:
-                            logger.debug("   Cache seq_len: ERROR")
+                            logger.info("   Cache seq_len: ERROR")
                     else:
-                        logger.debug(f"   ✅ Cache exists (tuple): {len(cache)} layers")
+                        logger.info(f"   ✅ Cache exists (tuple): {len(cache)} layers")
                 else:
                     logger.warning("   ⚠️  NO CACHE found on worker node!")
                     logger.warning(
@@ -838,25 +838,25 @@ class RingPipelineCoordinator:
                     logger.warning(
                         "   Worker nodes should maintain cache from previous steps!"
                     )
-                logger.debug("")
+                logger.info("")
             else:
                 # For new state, start from the beginning of our layer window
                 # This ensures we don't try to process layers that were already handled by previous nodes
                 start_layer = self.layer_window.layer_start if self.layer_window else 0
 
-                logger.debug("   Creating NEW state for request (first time seeing it)")
+                logger.info("   Creating NEW state for request (first time seeing it)")
 
                 # 🐛 DEBUG: Check if we should have cache
-                logger.debug("")
-                logger.debug("🔍 WORKER NODE - NEW REQUEST")
+                logger.info("")
+                logger.info("🔍 WORKER NODE - NEW REQUEST")
                 if request_id in self.inference_engine.caches:
                     logger.warning(
                         "   ⚠️  UNEXPECTED: Cache exists but no active_request state!"
                     )
                     logger.warning("   This might indicate state management issue")
                 else:
-                    logger.debug("   ✅ No cache (expected for first time)")
-                logger.debug("")
+                    logger.info("   ✅ No cache (expected for first time)")
+                logger.info("")
 
                 state = InferenceState(
                     request_id=request_id,
@@ -873,7 +873,7 @@ class RingPipelineCoordinator:
                     last_processed_step=-1,
                 )
                 self.active_requests[request_id] = state
-                logger.debug(f"   Created new state starting at layer {start_layer}")
+                logger.info(f"   Created new state starting at layer {start_layer}")
 
             state.hidden_states = tensor_data
             # Update position metadata if provided (allows updates during generation)
@@ -893,25 +893,25 @@ class RingPipelineCoordinator:
                 # Previous generation step completed all layers
                 # This is a NEW generation step - reset to process our layers again
                 start_layer = self.layer_window.layer_start if self.layer_window else 0
-                logger.debug(
+                logger.info(
                     f"   🔄 NEW GENERATION STEP DETECTED (current_layer={state.current_layer} >= {shard.n_layers})"
                 )
-                logger.debug(
+                logger.info(
                     f"   🔄 Resetting current_layer: {state.current_layer} → {start_layer}"
                 )
                 state.current_layer = start_layer
                 state.generation_step += 1
-                logger.debug(f"   🔄 Generation step: {state.generation_step}")
+                logger.info(f"   🔄 Generation step: {state.generation_step}")
             elif (
                 self.layer_window
                 and state.current_layer < self.layer_window.layer_start
             ):
                 # Current layer is before our window - advance to our window start
                 # This handles mid-stream joins or irregular layer distributions
-                logger.debug(
+                logger.info(
                     f"   ⚠️  current_layer ({state.current_layer}) < our window start ({self.layer_window.layer_start})"
                 )
-                logger.debug(
+                logger.info(
                     f"   ↪️  Advancing to window start: {self.layer_window.layer_start}"
                 )
                 state.current_layer = self.layer_window.layer_start
@@ -921,7 +921,7 @@ class RingPipelineCoordinator:
                 # CRITICAL: Store result and signal completion to waiting loop
                 state.final_result = tensor_data  # Store the logits
                 state.current_layer = shard.n_layers  # Mark all layers complete
-                logger.debug("   ✅ Final result received at HEAD, stored in state")
+                logger.info("   ✅ Final result received at HEAD, stored in state")
                 # Signal instant wakeup (no more 100ms polling delay)
                 event = self.completion_events.get(request_id)
                 if event:
@@ -929,7 +929,7 @@ class RingPipelineCoordinator:
                 return
 
             # Process and forward
-            logger.debug("   → Processing and forwarding...")
+            logger.info("   → Processing and forwarding...")
             await self._process_and_forward(request_id, state, shard)
 
         except Exception as e:
@@ -959,9 +959,9 @@ class RingPipelineCoordinator:
 
         tensor_bytes = data.tobytes()
         size_mb = len(tensor_bytes) / 1024 / 1024
-        logger.debug(f"   📤 Sending tensor: {size_mb:.2f} MB")
-        logger.debug(f"   📤 Target: {target_node_id[:16]}...")
-        logger.debug(f"   📤 Request ID: {request_id}")
+        logger.info(f"   📤 Sending tensor: {size_mb:.2f} MB")
+        logger.info(f"   📤 Target: {target_node_id[:16]}...")
+        logger.info(f"   📤 Request ID: {request_id}")
 
         # Build metadata (like prima.cpp's sync_meta)
         my_node_id = str(await self.network.iroh_node.net().node_id())
@@ -989,7 +989,7 @@ class RingPipelineCoordinator:
 
         send_time = time.time() - send_start
         throughput = size_mb / send_time if send_time > 0 else 0
-        logger.debug(
+        logger.info(
             f"   ✅ Tensor sent in {send_time * 1000:.1f}ms "
             f"({throughput:.1f} MB/s)"
         )
