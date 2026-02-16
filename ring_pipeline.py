@@ -944,89 +944,54 @@ class RingPipelineCoordinator:
         attention_mask: Optional[np.ndarray] = None,
     ):
         """
-        Send tensor to another node via Iroh blobs.
-        Based on prima.cpp's llama_send_tensors().
+        Send tensor to another node.
 
-        Prima.cpp sends:
-        - sub_gf_out (hidden states)
-        - inp_pos (position IDs) - CRITICAL for RoPE embeddings
-        - attention_mask (implicitly via batch metadata)
+        Uses direct QUIC transport (lattica-style) for high performance:
+        - Direct peer-to-peer QUIC stream (no Doc CRDT sync overhead)
+        - Binary framed protocol (no JSON/base64 encoding for tensor data)
+        - 4MB chunked transfer for large tensors
+        - Connection pooling with auto-reconnect
 
-        Uses Iroh's blob storage for large binary data (tensor),
-        and sends only the blob hash through the document.
+        Falls back to Doc-based blob transfer if direct transport unavailable.
         """
-        # Get document ID for communication
-        if not self.network.documents:
-            logger.error("No documents available for communication")
-            return
-
-        doc_id = next(iter(self.network.documents))
-
         send_start = time.time()
 
-        # Serialize tensor to bytes
         tensor_bytes = data.tobytes()
         size_mb = len(tensor_bytes) / 1024 / 1024
         logger.info(f"   📤 Sending tensor: {size_mb:.2f} MB")
         logger.info(f"   📤 Target: {target_node_id[:16]}...")
         logger.info(f"   📤 Request ID: {request_id}")
 
-        # Store tensor directly in document as a binary entry
-        # This ensures it syncs to all peers automatically
-        doc = self.network.documents[doc_id]
-        author = await self.network.iroh_node.authors().default()
-
-        # Create unique key for this tensor with timestamp and request ID
-        # This helps the receiver identify the exact tensor
-        timestamp_ms = int(time.time() * 1000)
-        tensor_key = f"tensor-{request_id}-{timestamp_ms}".encode("utf-8")
-
-        logger.info("   📝 Writing tensor to document as binary entry...")
-        write_start = time.time()
-        tensor_hash = await doc.set_bytes(author, tensor_key, tensor_bytes)
-        write_time = time.time() - write_start
-        logger.info(f"   ✅ Tensor written to document in {write_time * 1000:.1f}ms")
-        logger.info(f"   📍 Tensor blob hash: {str(tensor_hash)[:16]}...")
-
-        # Small delay to allow sync - give Iroh time to propagate the blob
-        await asyncio.sleep(0.1)
-
-        # Send metadata message with tensor key
-        # IMPORTANT: Include position_ids and attention_mask like prima.cpp does
-        message = {
-            "type": "ring_tensor_forward",
-            "sender_id": str(await self.network.iroh_node.net().node_id()),
-            "target_node_id": target_node_id,
+        # Build metadata (like prima.cpp's sync_meta)
+        my_node_id = str(await self.network.iroh_node.net().node_id())
+        metadata = {
+            "sender_id": my_node_id,
             "request_id": request_id,
-            "payload": {
-                "tensor_key": tensor_key.decode(
-                    "utf-8"
-                ),  # Key to fetch tensor from document
-                "tensor_hash": str(tensor_hash),  # Blob hash for direct lookup
-                "tensor_shape": list(data.shape),
-                "tensor_dtype": str(data.dtype),
-                "tensor_size": len(tensor_bytes),
-                "is_final": is_final,
-                # Critical metadata (like prima.cpp's inp_pos)
-                "position_ids": position_ids.tolist()
-                if position_ids is not None
-                else None,
-                "attention_mask": attention_mask.tolist()
-                if attention_mask is not None
-                else None,
-            },
-            "timestamp": time.time(),
+            "tensor_shape": list(data.shape),
+            "tensor_dtype": str(data.dtype),
+            "is_final": is_final,
+            "position_ids": position_ids.tolist()
+            if position_ids is not None
+            else None,
+            "attention_mask": attention_mask.tolist()
+            if attention_mask is not None
+            else None,
         }
 
-        success = await self.network.send_message(doc_id, message)
+        # Use direct QUIC transport (lattica-style)
+        await self.network.send_tensor_direct(
+            target_node_id=target_node_id,
+            tensor_data=data,
+            request_id=request_id,
+            metadata=metadata,
+        )
 
         send_time = time.time() - send_start
-        if success:
-            logger.info(f"   ✅ Tensor sent in {send_time * 1000:.1f}ms (total)")
-        else:
-            logger.error("   ❌ Failed to send message!")
-
-        return success
+        throughput = size_mb / send_time if send_time > 0 else 0
+        logger.info(
+            f"   ✅ Tensor sent in {send_time * 1000:.1f}ms "
+            f"({throughput:.1f} MB/s)"
+        )
 
     def _find_head_node_id(self) -> str:
         """Find the head node (rank 0) ID."""

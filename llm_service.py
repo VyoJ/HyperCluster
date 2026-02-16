@@ -707,6 +707,33 @@ class LLMService:
             inference_engine=self.inference_engine, network_node=self.network
         )
 
+        # Register direct tensor forwarding service (lattica-style)
+        if self.network.conn_manager and self.network.use_direct_transport:
+            from tensor_service import TensorForwardService
+
+            tensor_service = TensorForwardService()
+            tensor_service.set_node_id(str(await self.network.iroh_node.net().node_id()))
+
+            # Wire up the tensor callback to the ring coordinator
+            async def on_tensor_received(
+                sender_id, request_id, tensor_data, is_final,
+                position_ids=None, attention_mask=None
+            ):
+                if self.ring_coordinator and self.is_running:
+                    await self.ring_coordinator.handle_incoming_tensor(
+                        sender_id=sender_id,
+                        request_id=request_id,
+                        tensor_data=tensor_data,
+                        shard=self.current_shard,
+                        is_final=is_final,
+                        position_ids=position_ids,
+                        attention_mask=attention_mask,
+                    )
+
+            tensor_service.set_tensor_callback(on_tensor_received)
+            self.network.conn_manager.register_service(tensor_service)
+            logger.info("✅ Direct tensor forwarding service registered (lattica-style QUIC)")
+
         # Broadcast topology update to let other nodes know we exist
         logger.info("Broadcasting topology update to discover peers...")
         await self.network.broadcast_topology_update()

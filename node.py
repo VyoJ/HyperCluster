@@ -1,12 +1,15 @@
 import asyncio
+import hashlib
 import json
 import logging
+import struct
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import iroh
 import numpy as np
 from device_capabilities import DeviceCapabilities, get_device_capabilities
+from direct_transport import ConnectionManager, RpcServiceHandler, ALPN_HYPERCLUSTER, HyperClusterProtocolCreator
 from iroh import AddrInfoOptions, Iroh, LiveEventType, PublicKey, ShareMode
 from partitioning_strategy import (
     PartitioningStrategy,
@@ -52,14 +55,43 @@ class Node:
         # Cache for binary tensor data (hash -> content)
         self.tensor_cache: Dict[str, bytes] = {}  # hash_str -> binary_content
 
+        # Direct transport layer (lattica-style QUIC streams)
+        self.conn_manager: Optional[ConnectionManager] = None
+        self.use_direct_transport: bool = True  # Enable by default
+        self._tensor_handler: Optional[Callable] = None  # Handler for incoming tensors via direct transport
+        self._gossip_sender = None  # Gossip sender for lightweight messages
+        self._gossip_topic: Optional[bytes] = None
+        self._protocol_creator: Optional[HyperClusterProtocolCreator] = None
+
     async def start(self):
         """Start the Iroh node."""
         try:
             options = iroh.NodeOptions()
             options.enable_docs = True
+
+            # Register our ALPN protocol BEFORE creating the node
+            # This is how iroh knows to route incoming connections for our ALPN
+            # to our handler (like lattica's swarm.listen on /hypercluster/rpc/1)
+            if self.use_direct_transport:
+                self._protocol_creator = HyperClusterProtocolCreator()
+                options.protocols = {
+                    ALPN_HYPERCLUSTER: self._protocol_creator,
+                }
+                logger.info("📡 Registered ALPN protocol: hypercluster/rpc/1")
+
             self.iroh_node = await Iroh.memory_with_options(options)
             node_id = await self.iroh_node.net().node_id()
             logger.info(f"Iroh node started with ID: {node_id}")
+
+            # Initialize direct transport (lattica-style QUIC streams)
+            # Wire up the ConnectionManager to the protocol handler
+            if self.use_direct_transport:
+                self.conn_manager = ConnectionManager(self.iroh_node)
+                await self.conn_manager.start()
+                # Deferred binding: now that we have the ConnectionManager,
+                # wire it into the protocol handler
+                self._protocol_creator.set_conn_manager(self.conn_manager)
+                logger.info("✅ Direct transport layer initialized (lattica-style QUIC streams)")
 
             # Detect device capabilities
             self.device_capabilities = await get_device_capabilities()
@@ -74,6 +106,13 @@ class Node:
 
     async def stop(self):
         """Stop the Iroh node."""
+        if self.conn_manager:
+            await self.conn_manager.shutdown()
+        if self._gossip_sender:
+            try:
+                await self._gossip_sender.cancel()
+            except Exception:
+                pass
         if self.iroh_node:
             await self.iroh_node.node().shutdown()
             logger.info("Iroh node stopped.")
@@ -87,6 +126,42 @@ class Node:
             self.neighbors[doc_id] = set()
         self.neighbors[doc_id].add(peer_id)
         logger.info(f"Peer {peer_id} came online for doc {doc_id}")
+
+        # Register peer address with direct transport for QUIC streaming
+        if self.conn_manager and self.use_direct_transport:
+            asyncio.create_task(self._register_peer_for_direct_transport(str(peer_id)))
+
+    async def _register_peer_for_direct_transport(self, peer_id_str: str):
+        """Register a discovered peer's address with the ConnectionManager for QUIC streaming."""
+        try:
+            # Look up the peer in iroh's remote info table
+            peer_key = iroh.PublicKey.from_string(peer_id_str)
+            remote_info = await self.iroh_node.net().remote_info(peer_key)
+
+            if remote_info is not None:
+                # Build NodeAddr from RemoteInfo fields
+                relay_url = remote_info.relay_url
+                addrs = []
+                if hasattr(remote_info, 'addrs') and remote_info.addrs:
+                    for addr_info in remote_info.addrs:
+                        try:
+                            addrs.append(str(addr_info.addr()))
+                        except Exception:
+                            pass
+                peer_addr = iroh.NodeAddr(peer_key, relay_url, addrs)
+                await self.conn_manager.add_peer(peer_addr, peer_id_str)
+                logger.info(
+                    f"✅ Registered peer {peer_id_str[:16]}... for direct transport "
+                    f"(relay={relay_url is not None}, addrs={len(addrs)})"
+                )
+            else:
+                # Peer not yet in remote info — register with relay-only address
+                # iroh will resolve the actual address via relay/discovery
+                peer_addr = iroh.NodeAddr(peer_key, None, [])
+                await self.conn_manager.add_peer(peer_addr, peer_id_str)
+                logger.info(f"✅ Registered peer {peer_id_str[:16]}... for direct transport (discovery pending)")
+        except Exception as e:
+            logger.warning(f"Could not register peer {peer_id_str[:16]}... for direct transport: {e}")
 
     def remove_neighbor(self, doc_id: str, peer_id: PublicKey):
         if doc_id in self.neighbors and peer_id in self.neighbors[doc_id]:
@@ -464,6 +539,78 @@ class Node:
         }
 
         await self.broadcast_message(message)
+
+    # ===== Direct Transport Methods (lattica-style QUIC) =====
+
+    def register_tensor_handler(self, handler: Callable):
+        """Register a callback for incoming tensors via direct transport."""
+        self._tensor_handler = handler
+
+    async def send_tensor_direct(
+        self,
+        target_node_id: str,
+        tensor_data: np.ndarray,
+        request_id: str,
+        metadata: dict,
+    ):
+        """
+        Send tensor data directly to a peer via QUIC stream.
+
+        This is the lattica-style high-performance path:
+        - Direct QUIC connection (no Doc sync overhead)
+        - Binary framed protocol (no JSON/base64 encoding of tensor data)
+        - Chunked transfer for large tensors
+        - Connection pooling with auto-reconnect
+        """
+        if not self.conn_manager or not self.use_direct_transport:
+            # Fallback to doc-based sending
+            logger.warning("Direct transport not available, falling back to doc-based send")
+            return await self._send_tensor_via_doc(target_node_id, tensor_data, request_id, metadata)
+
+        try:
+            await self.conn_manager.send_tensor(
+                peer_id=target_node_id,
+                tensor_data=tensor_data,
+                request_id=request_id,
+                metadata=metadata,
+            )
+        except Exception as e:
+            logger.warning(f"Direct transport failed, falling back to doc-based: {e}")
+            await self._send_tensor_via_doc(target_node_id, tensor_data, request_id, metadata)
+
+    async def _send_tensor_via_doc(
+        self, target_node_id: str, tensor_data: np.ndarray, request_id: str, metadata: dict
+    ):
+        """Fallback: send tensor via Iroh Doc (slow path)."""
+        if not self.documents:
+            logger.error("No documents available for tensor fallback")
+            return
+
+        doc_id = next(iter(self.documents))
+        doc = self.documents[doc_id]
+        author = await self.iroh_node.authors().default()
+
+        tensor_bytes = tensor_data.tobytes()
+        timestamp_ms = int(time.time() * 1000)
+        tensor_key = f"tensor-{request_id}-{timestamp_ms}".encode("utf-8")
+        tensor_hash = await doc.set_bytes(author, tensor_key, tensor_bytes)
+
+        await asyncio.sleep(0.1)
+
+        metadata["tensor_key"] = tensor_key.decode("utf-8")
+        metadata["tensor_hash"] = str(tensor_hash)
+        metadata["tensor_size"] = len(tensor_bytes)
+
+        message = {
+            "type": "ring_tensor_forward",
+            "sender_id": str(await self.iroh_node.net().node_id()),
+            "target_node_id": target_node_id,
+            "request_id": request_id,
+            "payload": metadata,
+            "timestamp": time.time(),
+        }
+
+        await self.send_message(doc_id, message)
 
     async def handle_ring_tensor_message(self, message_data: Dict, llm_service):
         """
