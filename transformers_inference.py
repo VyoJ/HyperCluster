@@ -22,6 +22,7 @@ def _get_cache_seq_length(cache_state) -> int:
     Get sequence length from cache state.
 
     Supports both DynamicCache objects and tuple-based caches.
+    Handles sharded models where early cache slots may be empty.
 
     Args:
         cache_state: Either a DynamicCache object or tuple of per-layer caches
@@ -34,11 +35,29 @@ def _get_cache_seq_length(cache_state) -> int:
 
     # Check if it's a DynamicCache object
     if hasattr(cache_state, "get_seq_length"):
-        return cache_state.get_seq_length()
+        # Try default (layer 0) first
+        try:
+            seq_len = cache_state.get_seq_length()
+            if seq_len > 0:
+                return seq_len
+        except Exception:
+            pass
+
+        # If layer 0 is empty (e.g. sharded model with offset layers),
+        # find the first non-empty layer
+        if hasattr(cache_state, "key_cache"):
+            for i, key_tensor in enumerate(cache_state.key_cache):
+                if key_tensor is not None and key_tensor.dim() >= 3:
+                    return key_tensor.shape[2]
+        return 0
 
     # Check if it has key_cache attribute (DynamicCache alternative method)
     if hasattr(cache_state, "key_cache") and len(cache_state.key_cache) > 0:
-        return cache_state.key_cache[0].shape[2]
+        # Find first non-empty cache entry
+        for key_tensor in cache_state.key_cache:
+            if key_tensor is not None and key_tensor.dim() >= 3:
+                return key_tensor.shape[2]
+        return 0
 
     # Fallback: tuple/list of per-layer caches
     if isinstance(cache_state, (list, tuple)) and len(cache_state) > 0:

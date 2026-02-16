@@ -134,6 +134,22 @@ class TransformersShard:
             [all_layers[i] for i in range(self.start_layer, self.end_layer + 1)]
         )
 
+        # CRITICAL FIX: Re-index layer_idx on attention modules so the KV cache
+        # uses 0-based indices within this shard.
+        # Without this, a shard with layers 14-27 would create cache entries at
+        # indices 14-27 (with empty padding at 0-13), causing:
+        #   1. Cache reports 28 layers instead of 14
+        #   2. get_seq_length(0) returns 0 (empty slot) → cache_position always starts at 0
+        #   3. Position encoding corruption → gibberish output
+        for new_idx, layer in enumerate(self.layers):
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "layer_idx"):
+                old_idx = layer.self_attn.layer_idx
+                layer.self_attn.layer_idx = new_idx
+                if new_idx == 0 or new_idx == len(self.layers) - 1:
+                    logger.info(
+                        f"  Re-indexed layer {old_idx} → cache index {new_idx}"
+                    )
+
         # Extract rotary embeddings if present (needed for Qwen2, Llama, etc.)
         if hasattr(inner_model, "rotary_emb"):
             self.rotary_emb = inner_model.rotary_emb
