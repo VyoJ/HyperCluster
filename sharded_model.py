@@ -277,19 +277,19 @@ class TransformersShard:
                     raise ValueError(
                         "First shard requires either input_ids or inputs_embeds"
                     )
-                logger.info("🔍 EMBEDDING DEBUG:")
-                logger.info(f"   input_ids shape: {input_ids.shape}")
-                logger.info(
+                logger.debug("🔍 EMBEDDING DEBUG:")
+                logger.debug(f"   input_ids shape: {input_ids.shape}")
+                logger.debug(
                     f"   embed_tokens weight shape: {self.embed_tokens.weight.shape}"
                 )
-                logger.info(
+                logger.debug(
                     f"   Expected: (vocab_size={self.config.vocab_size}, hidden_size={self.config.hidden_size})"
                 )
 
                 hidden_states = self.embed_tokens(input_ids)
 
-                logger.info(f"   Actual hidden_states shape: {hidden_states.shape}")
-                logger.info(
+                logger.debug(f"   Actual hidden_states shape: {hidden_states.shape}")
+                logger.debug(
                     f"   Expected hidden_states shape: ({input_ids.shape[0]}, {input_ids.shape[1]}, {self.config.hidden_size})"
                 )
             else:
@@ -297,12 +297,12 @@ class TransformersShard:
         else:
             # Non-first shard: expect hidden states from previous shard
             if inputs_embeds is not None:
-                logger.info("🔍 WORKER SHARD DEBUG:")
-                logger.info(f"   Received inputs_embeds shape: {inputs_embeds.shape}")
-                logger.info(
+                logger.debug("🔍 WORKER SHARD DEBUG:")
+                logger.debug(f"   Received inputs_embeds shape: {inputs_embeds.shape}")
+                logger.debug(
                     f"   Expected shape: (batch_size, seq_len, {self.config.hidden_size})"
                 )
-                logger.info(
+                logger.debug(
                     f"   This shard handles layers: {self.start_layer} to {self.end_layer}"
                 )
 
@@ -327,7 +327,7 @@ class TransformersShard:
 
             past_key_values = DynamicCache()
             shared_cache_object = True
-            logger.info("   🆕 Created new DynamicCache for use_cache=True")
+            logger.debug("   🆕 Created new DynamicCache for use_cache=True")
         elif past_key_values is None:
             # use_cache=False, keep as None
             past_key_values = None
@@ -382,13 +382,13 @@ class TransformersShard:
                     if cache_position.dim() == 1
                     else cache_position
                 )
-                logger.info(
+                logger.debug(
                     f"✅ Using cache_position for RoPE: {cache_position.tolist()}"
                 )
             elif position_ids is not None:
                 # Fallback to position_ids if cache_position not available (legacy mode)
                 rope_position_ids = position_ids
-                logger.info(
+                logger.debug(
                     f"⚠️  Fallback: using position_ids for RoPE: {position_ids.tolist()}"
                 )
             else:
@@ -397,13 +397,13 @@ class TransformersShard:
                 rope_position_ids = torch.arange(
                     seq_length, dtype=torch.long, device=device
                 ).unsqueeze(0)
-                logger.info(
+                logger.debug(
                     f"⚠️  Created position_ids for RoPE (no cache_position or position_ids): {rope_position_ids.tolist()}"
                 )
 
             # Compute rotary embeddings using the appropriate position tensor
             position_embeddings = self.rotary_emb(hidden_states, rope_position_ids)
-            logger.info(
+            logger.debug(
                 f"✅ Computed position_embeddings for positions: {rope_position_ids.tolist()}"
             )
 
@@ -443,56 +443,56 @@ class TransformersShard:
             # Forward through this layer
             # Different models have different signatures, so we try to be flexible
             if layer_idx == 0:
-                logger.info(f"   Layer {layer_idx} kwargs: {list(layer_kwargs.keys())}")
-                logger.info(
+                logger.debug(f"   Layer {layer_idx} kwargs: {list(layer_kwargs.keys())}")
+                logger.debug(
                     f"   🔍 CRITICAL: use_cache value being passed: {layer_kwargs['use_cache']}"
                 )
-                logger.info(
+                logger.debug(
                     f"   🔍 CRITICAL: past_key_value type: {type(layer_kwargs['past_key_value'])}"
                 )
-                logger.info(
+                logger.debug(
                     f"   🔍 CRITICAL: past_key_value value: {layer_kwargs['past_key_value']}"
                 )
                 # CRITICAL: Inspect the actual layer forward signature
                 import inspect
 
                 sig = inspect.signature(layer.forward)
-                logger.info(f"   🔍 Layer forward signature: {sig}")
-                logger.info(
+                logger.debug(f"   🔍 Layer forward signature: {sig}")
+                logger.debug(
                     f"   🔍 Layer forward parameters: {list(sig.parameters.keys())}"
                 )
 
             try:
                 layer_outputs = layer(**layer_kwargs)
                 if layer_idx == 0:
-                    logger.info(
+                    logger.debug(
                         f"   Layer {layer_idx} output type: {type(layer_outputs)}"
                     )
                     if isinstance(layer_outputs, tuple):
-                        logger.info(
+                        logger.debug(
                             f"   Layer {layer_idx} tuple length: {len(layer_outputs)}"
                         )
                         for i, item in enumerate(layer_outputs):
-                            logger.info(
+                            logger.debug(
                                 f"   Layer {layer_idx} output[{i}] type: {type(item)}, shape: {item.shape if hasattr(item, 'shape') else 'N/A'}"
                             )
             except TypeError as e:
                 # Try without cache_position if it fails
                 if layer_idx == 0:
-                    logger.info(f"   Layer {layer_idx}: TypeError on first call: {e}")
-                    logger.info("   Trying without cache_position...")
+                    logger.debug(f"   Layer {layer_idx}: TypeError on first call: {e}")
+                    logger.debug("   Trying without cache_position...")
                 layer_kwargs.pop("cache_position", None)
                 try:
                     layer_outputs = layer(**layer_kwargs)
                 except TypeError as e2:
                     if layer_idx == 0:
-                        logger.info(
+                        logger.debug(
                             f"   Layer {layer_idx}: TypeError on second call: {e2}"
                         )
-                        logger.info(
+                        logger.debug(
                             "   Layer signature might not support use_cache or other parameters"
                         )
-                        logger.info("   Trying with minimal kwargs...")
+                        logger.debug("   Trying with minimal kwargs...")
                     # Last resort: try with minimal parameters
                     layer_outputs = layer(hidden_states, attention_mask=attention_mask)
 
@@ -518,13 +518,13 @@ class TransformersShard:
                                 if isinstance(layer_outputs[cache_idx], tuple)
                                 else "not-tuple"
                             )
-                            logger.info(
+                            logger.debug(
                                 f"   Layer {layer_idx}: extracted cache at index {cache_idx}, shape: {cache_shape}"
                             )
                     else:
                         next_decoder_cache.append(None)
                         if layer_idx == 0:  # Log first layer only
-                            logger.info(
+                            logger.debug(
                                 f"   Layer {layer_idx}: Layer returned tuple length {len(layer_outputs)} (modern transformers update cache in-place)"
                             )
 
@@ -544,13 +544,13 @@ class TransformersShard:
                     if hasattr(layer_outputs, "past_key_value"):
                         next_decoder_cache.append(layer_outputs.past_key_value)
                         if layer_idx == 0:  # Log first layer only
-                            logger.info(
+                            logger.debug(
                                 f"   Layer {layer_idx}: extracted cache from object.past_key_value"
                             )
                     else:
                         next_decoder_cache.append(None)
                         if layer_idx == 0:  # Log first layer only
-                            logger.info(
+                            logger.debug(
                                 f"   Layer {layer_idx}: Object output (modern transformers update cache in-place)"
                             )
 
@@ -562,40 +562,40 @@ class TransformersShard:
         # This prevents intermediate nodes from applying LM head when forwarding tensors
         if apply_lm_head is not None:
             is_last = apply_lm_head
-            logger.info(f"🔄 Ring mode: apply_lm_head explicitly set to {apply_lm_head}")
+            logger.debug(f"🔄 Ring mode: apply_lm_head explicitly set to {apply_lm_head}")
         else:
             is_last = self.shard.is_last_layer()
 
         # Debug logging
-        logger.info(
+        logger.debug(
             f"🔍 Shard check: start={self.shard.start_layer}, end={self.shard.end_layer}, "
             f"n_layers={self.shard.n_layers}, is_last={is_last}"
         )
-        logger.info(
+        logger.debug(
             f"   Hidden states shape before final processing: {hidden_states.shape}"
         )
 
         if is_last:
-            logger.info("   ✅ IS LAST SHARD - Applying LM head")
+            logger.debug("   ✅ IS LAST SHARD - Applying LM head")
             # Apply final norm if available
             if self.norm is not None:
                 hidden_states = self.norm(hidden_states)
-                logger.info(f"   After norm: {hidden_states.shape}")
+                logger.debug(f"   After norm: {hidden_states.shape}")
 
             # Apply lm_head to get logits
             if self.lm_head is not None:
-                logger.info(
+                logger.debug(
                     f"   Applying LM head: hidden_states shape {hidden_states.shape}"
                 )
                 logits = self.lm_head(hidden_states)
                 # Ensure logits are float32 for numerical stability
                 logits = logits.float()
-                logger.info(f"   LM head output shape: {logits.shape}")
+                logger.debug(f"   LM head output shape: {logits.shape}")
             else:
                 logits = hidden_states
         else:
             # For non-last shards, output is hidden states
-            logger.info(
+            logger.debug(
                 f"   ❌ NOT LAST SHARD - Returning hidden states with shape {hidden_states.shape}"
             )
             logits = hidden_states
@@ -634,11 +634,11 @@ class TransformersShard:
                     cache_num_layers = (
                         len(next_cache) if hasattr(next_cache, "__len__") else "unknown"
                     )
-                    logger.info(
+                    logger.debug(
                         f"   📦 Cache object returned: {cache_num_layers} layers, seq_len={cache_seq_len}"
                     )
                 except Exception:
-                    logger.info(f"   📦 Cache object returned: {type(next_cache)}")
+                    logger.debug(f"   📦 Cache object returned: {type(next_cache)}")
             elif len(next_cache) > 0:
                 # Old-style tuple cache
                 if next_cache[0] is not None:
@@ -647,15 +647,15 @@ class TransformersShard:
                         if isinstance(next_cache[0], tuple)
                         else "unknown"
                     )
-                    logger.info(
+                    logger.debug(
                         f"   📦 Cache tuple created: {len(next_cache)} layers, first layer cache shape: {cache_shape}"
                     )
                 else:
-                    logger.info(
+                    logger.debug(
                         f"   📦 Cache tuple created: {len(next_cache)} layers, but first layer cache is None"
                     )
         else:
-            logger.info(
+            logger.debug(
                 f"   📦 No cache returned (use_cache={use_cache}, shared_cache={shared_cache_object})"
             )
 
@@ -709,7 +709,7 @@ def load_sharded_model(
     Returns:
         TransformersShard wrapper around the loaded model
     """
-    logger.info(f"Loading model {model_path} for shard {shard}")
+    logger.debug(f"Loading model {model_path} for shard {shard}")
 
     # Load config
     config = AutoConfig.from_pretrained(
@@ -744,5 +744,5 @@ def load_sharded_model(
     # Set to eval mode by default
     sharded_model.eval()
 
-    logger.info(f"Successfully loaded and sharded model {model_path}")
+    logger.debug(f"Successfully loaded and sharded model {model_path}")
     return sharded_model

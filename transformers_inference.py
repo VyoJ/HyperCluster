@@ -198,9 +198,9 @@ class TransformersShardedInferenceEngine(InferenceEngine):
 
                 # DEBUG: Show top-5 predictions
                 top_probs, top_indices = torch.topk(probs[0], k=5)
-                logger.info("🎲 Top-5 predictions:")
+                logger.debug("🎲 Top-5 predictions:")
                 for i, (prob, idx) in enumerate(zip(top_probs, top_indices)):
-                    logger.info(
+                    logger.debug(
                         f"   {i + 1}. Token {idx.item()}: {prob.item():.4f} ({prob.item() * 100:.2f}%)"
                     )
 
@@ -259,34 +259,34 @@ class TransformersShardedInferenceEngine(InferenceEngine):
             past_length = _get_cache_seq_length(cache_state)
 
             # 🐛 DEBUG: Detailed cache inspection
-            logger.info("=" * 80)
-            logger.info("🔍 KV CACHE DEBUG")
-            logger.info("=" * 80)
-            logger.info(f"Request ID: {request_id}")
-            logger.info(
+            logger.debug("=" * 80)
+            logger.debug("🔍 KV CACHE DEBUG")
+            logger.debug("=" * 80)
+            logger.debug(f"Request ID: {request_id}")
+            logger.debug(
                 f"My shard: {self.shard.start_layer}-{self.shard.end_layer} ({self.shard.end_layer - self.shard.start_layer + 1} layers)"
             )
-            logger.info(f"Total model layers: {self.shard.n_layers}")
+            logger.debug(f"Total model layers: {self.shard.n_layers}")
 
             if cache_state is not None:
-                logger.info(f"✅ Cache EXISTS for request {request_id}")
-                logger.info(f"   Cache type: {type(cache_state).__name__}")
+                logger.debug(f"✅ Cache EXISTS for request {request_id}")
+                logger.debug(f"   Cache type: {type(cache_state).__name__}")
 
                 # Inspect cache structure
                 if hasattr(cache_state, "key_cache"):
                     # DynamicCache or similar
                     num_cached_layers = len(cache_state.key_cache)
-                    logger.info(f"   Number of layers in cache: {num_cached_layers}")
-                    logger.info(f"   Sequence length: {past_length}")
+                    logger.debug(f"   Number of layers in cache: {num_cached_layers}")
+                    logger.debug(f"   Sequence length: {past_length}")
 
                     # Show shape of each cached layer
                     for i, key_tensor in enumerate(
                         cache_state.key_cache[: min(3, num_cached_layers)]
                     ):
                         if key_tensor is not None:
-                            logger.info(f"   Layer {i} key shape: {key_tensor.shape}")
+                            logger.debug(f"   Layer {i} key shape: {key_tensor.shape}")
                     if num_cached_layers > 3:
-                        logger.info(f"   ... and {num_cached_layers - 3} more layers")
+                        logger.debug(f"   ... and {num_cached_layers - 3} more layers")
 
                     # 🚨 CRITICAL CHECK: Does cache have ALL model layers or just my shard's layers?
                     expected_layers = self.shard.end_layer - self.shard.start_layer + 1
@@ -301,19 +301,19 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                         logger.warning(f"   Got {num_cached_layers} layers in cache")
                 elif hasattr(cache_state, "__len__"):
                     num_cached_layers = len(cache_state)
-                    logger.info(
+                    logger.debug(
                         f"   Number of layers in cache (tuple): {num_cached_layers}"
                     )
-                    logger.info(f"   Sequence length: {past_length}")
+                    logger.debug(f"   Sequence length: {past_length}")
                 else:
-                    logger.info(f"   Cache object: {cache_state}")
+                    logger.debug(f"   Cache object: {cache_state}")
 
-                logger.info("🔄 Will REUSE cache from previous step")
+                logger.debug("🔄 Will REUSE cache from previous step")
             else:
-                logger.info(f"❌ NO cache found for request {request_id}")
-                logger.info("🆕 Will CREATE new cache")
+                logger.debug(f"❌ NO cache found for request {request_id}")
+                logger.debug("🆕 Will CREATE new cache")
 
-            logger.info("=" * 80)
+            logger.debug("=" * 80)
 
             # Prepare inputs based on shard position and input shape
             if self.shard.is_first_layer() and input_tensor.dim() <= 2:
@@ -330,7 +330,7 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                     position_ids_tensor = (
                         torch.from_numpy(position_ids).long().to(device)
                     )
-                    logger.info(
+                    logger.debug(
                         f"Using provided position_ids: {position_ids_tensor.shape}"
                     )
                 else:
@@ -369,7 +369,7 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                     attention_mask_tensor = (
                         torch.from_numpy(attention_mask).bool().to(device)
                     )
-                    logger.info(
+                    logger.debug(
                         f"Using provided attention_mask: {attention_mask_tensor.shape}"
                     )
 
@@ -386,7 +386,7 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                         attention_mask_tensor = torch.cat(
                             [past_mask, attention_mask_tensor], dim=1
                         )
-                        logger.info(
+                        logger.debug(
                             f"📏 Expanded attention_mask for cache: {past_length} cached + {seq_len} new = {attention_mask_tensor.shape[1]} total"
                         )
                         # DEBUG: Check for any False values (masked positions)
@@ -399,7 +399,7 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                                 f"   Attention mask: {attention_mask_tensor}"
                             )
                         else:
-                            logger.info(
+                            logger.debug(
                                 f"✅ Attention mask: all {attention_mask_tensor.shape[1]} positions UNMASKED (all True)"
                             )
                 else:
@@ -432,7 +432,7 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                         dtype=torch.long,
                         device=device,
                     )
-                    logger.info(
+                    logger.debug(
                         f"🎯 Created cache_position: {cache_position.tolist()} (cache has {past_length} tokens)"
                     )
                 else:
@@ -440,7 +440,7 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                     cache_position = torch.arange(
                         seq_len, dtype=torch.long, device=device
                     )
-                    logger.info(
+                    logger.debug(
                         f"🎯 Created cache_position: {cache_position.tolist()} (new cache)"
                     )
 
@@ -458,7 +458,7 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                     "cache_position": cache_position,
                     "apply_lm_head": is_final,  # Only apply LM head if this completes all layers
                 }
-                logger.info(
+                logger.debug(
                     f"🔧 Using cache_position={cache_position.tolist()}, letting model compute position_ids and attention_mask internally"
                 )
             else:
@@ -498,7 +498,7 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                         torch.from_numpy(position_ids).long().to(device)
                     )
                     inputs["position_ids"] = position_ids_tensor
-                    logger.info(
+                    logger.debug(
                         f"Non-first shard using position_ids: {position_ids_tensor.shape}"
                     )
 
@@ -508,7 +508,7 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                         torch.from_numpy(attention_mask).bool().to(device)
                     )
                     inputs["attention_mask"] = attention_mask_tensor
-                    logger.info(
+                    logger.debug(
                         f"Non-first shard using attention_mask: {attention_mask_tensor.shape}"
                     )
 
@@ -523,7 +523,7 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                         device=device,
                     )
                     inputs["cache_position"] = cache_position
-                    logger.info(
+                    logger.debug(
                         f"🎯 Non-first shard cache_position: {cache_position.tolist()}"
                     )
                 else:
@@ -531,7 +531,7 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                         seq_len, dtype=torch.long, device=device
                     )
                     inputs["cache_position"] = cache_position
-                    logger.info(
+                    logger.debug(
                         f"🎯 Non-first shard cache_position: {cache_position.tolist()} (new cache)"
                     )
 
@@ -548,9 +548,9 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                     self.caches[request_id] = outputs.past_key_values
 
                     # 🐛 DEBUG: Detailed cache update logging
-                    logger.info("=" * 80)
-                    logger.info("💾 KV CACHE UPDATE")
-                    logger.info("=" * 80)
+                    logger.debug("=" * 80)
+                    logger.debug("💾 KV CACHE UPDATE")
+                    logger.debug("=" * 80)
 
                     # Log cache size to verify it's growing
                     # Handle both Cache objects (modern) and tuple caches (legacy)
@@ -560,12 +560,12 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                             cache_seq_len = outputs.past_key_values.get_seq_length(0)
                             cache_num_layers = len(outputs.past_key_values)
 
-                            logger.info(
+                            logger.debug(
                                 f"Cache type: {type(outputs.past_key_values).__name__}"
                             )
-                            logger.info(f"Number of layers cached: {cache_num_layers}")
-                            logger.info(f"Sequence length: {cache_seq_len}")
-                            logger.info(
+                            logger.debug(f"Number of layers cached: {cache_num_layers}")
+                            logger.debug(f"Sequence length: {cache_seq_len}")
+                            logger.debug(
                                 f"My shard layers: {self.shard.start_layer}-{self.shard.end_layer}"
                             )
 
@@ -574,7 +574,7 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                                 self.shard.end_layer - self.shard.start_layer + 1
                             )
                             if cache_num_layers == expected_shard_layers:
-                                logger.info(
+                                logger.debug(
                                     f"✅ Cache matches shard: {cache_num_layers} layers"
                                 )
                             elif cache_num_layers == self.shard.n_layers:
@@ -594,7 +594,7 @@ class TransformersShardedInferenceEngine(InferenceEngine):
 
                             # Show individual layer cache shapes (first 3 and last 1)
                             if hasattr(outputs.past_key_values, "key_cache"):
-                                logger.info("Layer-by-layer cache inspection:")
+                                logger.debug("Layer-by-layer cache inspection:")
                                 for i in range(min(3, cache_num_layers)):
                                     k_shape = (
                                         outputs.past_key_values.key_cache[i].shape
@@ -608,7 +608,7 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                                         is not None
                                         else None
                                     )
-                                    logger.info(
+                                    logger.debug(
                                         f"   Layer {i}: K={k_shape}, V={v_shape}"
                                     )
                                 if cache_num_layers > 4:
@@ -625,8 +625,8 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                                         is not None
                                         else None
                                     )
-                                    logger.info("   ...")
-                                    logger.info(
+                                    logger.debug("   ...")
+                                    logger.debug(
                                         f"   Layer {i}: K={k_shape}, V={v_shape}"
                                     )
                         else:
@@ -637,16 +637,16 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                                 else 0
                             )
                             cache_num_layers = len(outputs.past_key_values)
-                            logger.info("Cache type: tuple (legacy)")
-                            logger.info(f"Number of layers cached: {cache_num_layers}")
-                            logger.info(f"Sequence length: {cache_seq_len}")
+                            logger.debug("Cache type: tuple (legacy)")
+                            logger.debug(f"Number of layers cached: {cache_num_layers}")
+                            logger.debug(f"Sequence length: {cache_seq_len}")
 
-                        logger.info(f"✅ Cache updated for request {request_id}")
+                        logger.debug(f"✅ Cache updated for request {request_id}")
                     except Exception as e:
                         logger.warning(f"Could not inspect cache structure: {e}")
-                        logger.info(f"✅ Updated KV cache for request {request_id}")
+                        logger.debug(f"✅ Updated KV cache for request {request_id}")
 
-                    logger.info("=" * 80)
+                    logger.debug("=" * 80)
                 else:
                     logger.warning("⚠️  Model did not return past_key_values!")
                     logger.warning(
