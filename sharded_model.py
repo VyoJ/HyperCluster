@@ -519,6 +519,76 @@ class TransformersShard:
                 f"✅ Computed position_embeddings for positions: {rope_position_ids.tolist()}"
             )
 
+        # CRITICAL: Create proper 4D causal attention mask
+        # TransformersShard bypasses the model's forward() which normally creates this
+        # via create_causal_mask(). Without it, eager attention has NO causal masking
+        # and dimension errors can occur with KV cache.
+        causal_mask = attention_mask  # Use provided mask if any
+        if causal_mask is None or (isinstance(causal_mask, torch.Tensor) and causal_mask.dim() == 2):
+            try:
+                from transformers.masking_utils import create_causal_mask
+
+                # Compute position_ids for mask creation
+                if cache_position is not None:
+                    mask_position_ids = (
+                        cache_position.unsqueeze(0)
+                        if cache_position.dim() == 1
+                        else cache_position
+                    )
+                elif position_ids is not None:
+                    mask_position_ids = position_ids
+                else:
+                    mask_position_ids = torch.arange(
+                        hidden_states.shape[1],
+                        dtype=torch.long,
+                        device=hidden_states.device,
+                    ).unsqueeze(0)
+
+                mask_cache_position = (
+                    cache_position
+                    if cache_position is not None
+                    else torch.arange(
+                        hidden_states.shape[1],
+                        dtype=torch.long,
+                        device=hidden_states.device,
+                    )
+                )
+
+                causal_mask = create_causal_mask(
+                    config=self.config,
+                    input_embeds=hidden_states,
+                    attention_mask=causal_mask,  # Pass 2D mask or None
+                    cache_position=mask_cache_position,
+                    past_key_values=past_key_values if shared_cache_object else None,
+                    position_ids=mask_position_ids,
+                )
+                logger.debug(
+                    f"✅ Created causal mask: {causal_mask.shape if causal_mask is not None else 'None (SDPA handles internally)'}"
+                )
+            except (ImportError, Exception) as e:
+                logger.warning(f"Could not create causal mask via transformers: {e}")
+                # Fallback: create a simple causal mask manually for eager attention
+                seq_length = hidden_states.shape[1]
+                past_seen = 0
+                if shared_cache_object and past_key_values is not None:
+                    try:
+                        past_seen = past_key_values.get_seq_length()
+                    except Exception:
+                        pass
+                kv_length = past_seen + seq_length
+                min_dtype = torch.finfo(hidden_states.dtype).min
+                causal_mask = torch.full(
+                    (seq_length, kv_length),
+                    fill_value=min_dtype,
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+                causal_mask = torch.triu(causal_mask, diagonal=past_seen + 1)
+                causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, seq, kv)
+                logger.debug(
+                    f"✅ Created fallback causal mask: {causal_mask.shape}"
+                )
+
         # Process through our shard's layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
@@ -536,7 +606,7 @@ class TransformersShard:
             # Passing both causes position mismatch and gibberish output.
             layer_kwargs = {
                 "hidden_states": hidden_states,
-                "attention_mask": attention_mask,
+                "attention_mask": causal_mask,
                 # CRITICAL: Qwen3 layer signature expects `past_key_value` (singular)
                 # not `past_key_values` (plural) - see layer forward signature
                 "past_key_value": past_key_value,

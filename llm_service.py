@@ -849,6 +849,35 @@ class LLMService:
                 model_total_layers=self.base_shard.n_layers,  # Use base_shard for full model spec
             )
             logger.info("Ring re-initialized successfully")
+
+            # CRITICAL: Re-shard the model to match the new ring layer assignment.
+            # Without this, the model still has the OLD shard loaded (e.g., layers 0-27)
+            # while the ring now expects this node to process only a subset (e.g., 18-27).
+            # This causes dimension mismatches and incorrect inference.
+            if self.ring_coordinator.layer_window and self.inference_engine:
+                new_shard = Shard(
+                    model_id=self.base_shard.model_id,
+                    start_layer=self.ring_coordinator.layer_window.layer_start,
+                    end_layer=self.ring_coordinator.layer_window.layer_end,
+                    n_layers=self.base_shard.n_layers,
+                )
+
+                if self.current_shard != new_shard:
+                    logger.info(
+                        f"🔄 Shard assignment changed: {self.current_shard} → {new_shard}"
+                    )
+                    logger.info(
+                        f"   Reloading model with layers {new_shard.start_layer}-{new_shard.end_layer} "
+                        f"(was {self.current_shard.start_layer}-{self.current_shard.end_layer})"
+                    )
+                    self.current_shard = new_shard
+                    await self.inference_engine.ensure_shard(
+                        new_shard, force_reload=True
+                    )
+                    logger.info("✅ Model re-sharded successfully")
+                else:
+                    logger.info("Shard assignment unchanged, no reload needed")
+
         except Exception as e:
             logger.error(f"Failed to re-initialize ring: {e}", exc_info=True)
 

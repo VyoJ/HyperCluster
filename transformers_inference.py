@@ -698,31 +698,40 @@ class TransformersShardedInferenceEngine(InferenceEngine):
         output_data = await self._run_in_model_thread(_infer)
         return output_data, inference_state
 
-    async def ensure_shard(self, shard: Shard):
+    async def ensure_shard(self, shard: Shard, force_reload: bool = False):
         """
         Ensure the correct model shard is loaded.
 
         Note: In ring pipeline mode, each node loads its assigned shard once.
         Subsequent calls with different shard specs (e.g., base_shard vs current_shard)
         for the SAME model_id will reuse the already-loaded shard to avoid reloading.
+
+        Args:
+            shard: The shard specification to ensure is loaded.
+            force_reload: If True, force reloading even if same model_id (for re-sharding).
         """
         async with self._shard_lock:
             # Quick check if already loaded
-            if self.shard == shard:
+            if self.shard == shard and not force_reload:
                 return
 
             # For now, use HuggingFace model ID directly
             # In future, this will download from a shard downloader
             model_id = shard.model_id
 
-            # Only reload if model_id changes, NOT if just layer range changes
-            # This allows ring pipeline to pass base_shard for coordination
-            # while keeping the node's assigned shard loaded
-            if self.shard is None or self.shard.model_id != shard.model_id:
+            # Reload if:
+            # 1. No shard loaded yet
+            # 2. Different model_id
+            # 3. Force reload requested (e.g., topology update changed shard assignment)
+            if self.shard is None or self.shard.model_id != shard.model_id or force_reload:
+                logger.info(
+                    f"Loading shard: {shard} "
+                    f"(previous: {self.shard}, force={force_reload})"
+                )
                 await self._load_shard(model_id, shard)
                 self.shard = shard
 
-                # Clear caches and session when switching models
+                # Clear caches and session when switching models/shards
                 self.caches.clear()
                 self.session.clear()
             else:
