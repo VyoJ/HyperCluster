@@ -22,12 +22,18 @@ class DeviceCapabilities:
         chip: Chip/processor name (e.g., "M2", "AMD Ryzen 9")
         memory: Available memory in GB
         flops: Floating point operations per second (FLOPS)
+        role: Node role - 'compute_provider' (loads LLM layers) or 'inference_only' (queries only)
     """
 
     model: str
     chip: str
     memory: int  # in GB
     flops: float  # TFLOPS
+    role: str = "compute_provider"  # 'compute_provider' or 'inference_only'
+
+    def is_compute_provider(self) -> bool:
+        """Check if this node is a compute provider (loads LLM layers)."""
+        return self.role == "compute_provider"
 
     def to_dict(self):
         """Convert to dictionary for serialization."""
@@ -36,15 +42,19 @@ class DeviceCapabilities:
             "chip": self.chip,
             "memory": self.memory,
             "flops": self.flops,
+            "role": self.role,
         }
 
     @staticmethod
     def from_dict(data: dict) -> "DeviceCapabilities":
         """Create from dictionary."""
+        # Handle older data that may not have 'role'
+        if "role" not in data:
+            data["role"] = "compute_provider"
         return DeviceCapabilities(**data)
 
     def __str__(self):
-        return f"DeviceCapabilities(model={self.model}, chip={self.chip}, memory={self.memory}GB, flops={self.flops:.2f}TFLOPS)"
+        return f"DeviceCapabilities(model={self.model}, chip={self.chip}, memory={self.memory}GB, flops={self.flops:.2f}TFLOPS, role={self.role})"
 
 
 # Unknown/default device capabilities

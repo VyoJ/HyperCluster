@@ -35,6 +35,9 @@ class Node:
         self.system_info = {}
         self.neighbors: Dict[str, Set[PublicKey]] = {}  # doc_id -> set of peer_ids
 
+        # Node role: 'compute_provider' (loads LLM layers) or 'inference_only' (queries only)
+        self.node_role: str = "compute_provider"
+
         # Sharded inference infrastructure
         self.topology: Topology = Topology()
         self.device_capabilities: DeviceCapabilities = DeviceCapabilities(
@@ -399,9 +402,39 @@ class Node:
             for peer_id in peers:
                 self.topology.add_edge(node_id, str(peer_id), f"doc:{doc_id[:8]}")
 
+    def set_node_role(self, role: str):
+        """Set the node's role ('compute_provider' or 'inference_only')."""
+        if role not in ('compute_provider', 'inference_only'):
+            raise ValueError(f"Invalid role: {role}. Must be 'compute_provider' or 'inference_only'")
+        self.node_role = role
+        self.device_capabilities.role = role
+        logger.info(f"Node role set to: {role}")
+
+    def get_compute_provider_topology(self) -> Topology:
+        """
+        Get a filtered topology containing only compute-provider nodes.
+        
+        Returns:
+            A Topology object with only compute-provider nodes
+        """
+        compute_topology = Topology()
+        for node_id, capabilities in self.topology.all_nodes():
+            if capabilities.is_compute_provider():
+                compute_topology.update_node(node_id, capabilities)
+        
+        # Copy edges between compute-provider nodes
+        for node_id, connections in self.topology.peer_graph.items():
+            if node_id in compute_topology.nodes:
+                for conn in connections:
+                    if conn.to_id in compute_topology.nodes:
+                        compute_topology.add_edge(conn.from_id, conn.to_id, conn.description)
+        
+        return compute_topology
+
     async def get_current_shard(self, base_shard: Shard) -> Optional[Shard]:
         """
         Get the shard assigned to this node based on current topology.
+        Only considers compute-provider nodes for sharding.
 
         Args:
             base_shard: The base model shard (full model spec)
@@ -414,8 +447,15 @@ class Node:
 
         node_id = str(await self.iroh_node.net().node_id())
 
-        # Get partitions from strategy
-        partitions = self.partitioning_strategy.partition(self.topology)
+        # Only shard across compute-provider nodes
+        compute_topology = self.get_compute_provider_topology()
+        
+        if not compute_topology.all_nodes():
+            logger.warning("No compute-provider nodes found in topology")
+            return None
+
+        # Get partitions from strategy (using compute-provider-only topology)
+        partitions = self.partitioning_strategy.partition(compute_topology)
 
         # Find our partition index
         partition_index = None
@@ -425,7 +465,7 @@ class Node:
                 break
 
         if partition_index is None:
-            logger.warning(f"Node {node_id} not found in partitions")
+            logger.warning(f"Node {node_id} not found in compute-provider partitions")
             return None
 
         # Map partitions to shards

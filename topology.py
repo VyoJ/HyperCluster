@@ -53,6 +53,13 @@ class Topology:
         """Get all nodes as list of (node_id, capabilities) tuples."""
         return list(self.nodes.items())
 
+    def compute_provider_nodes(self) -> List[Tuple[str, DeviceCapabilities]]:
+        """Get only compute-provider nodes (nodes that load LLM layers)."""
+        return [
+            (nid, cap) for nid, cap in self.nodes.items()
+            if cap.is_compute_provider()
+        ]
+
     def add_edge(self, from_id: str, to_id: str, description: Optional[str] = None):
         """Add a connection between two nodes."""
         if from_id not in self.peer_graph:

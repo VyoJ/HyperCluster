@@ -240,6 +240,11 @@ class LLMService:
             await self._send_llm_data(error_response)
             return
 
+        # Inference-only nodes don't process queries locally - they only send them
+        if self.network.node_role == "inference_only":
+            logger.info("   ↩️  Inference-only node - queries are processed by compute-provider nodes")
+            return
+
         if not query:
             logger.warning("   ⚠️  No query content")
             return
@@ -492,7 +497,23 @@ class LLMService:
     # ===== Sharded Inference Methods =====
 
     async def _init_sharded_inference(self, num_layers: int):
-        """Initialize sharded inference engine and determine this node's shard."""
+        """Initialize sharded inference engine and determine this node's shard.
+        
+        Only compute-provider nodes will load model layers.
+        The shard assignment is based only on compute-provider nodes in the topology.
+        """
+        # Check if this node is a compute provider
+        if self.network.node_role != "compute_provider":
+            logger.info("Node is inference-only, skipping model layer loading")
+            # Still create the base shard for reference
+            self.base_shard = Shard(
+                model_id=self.model_name,
+                start_layer=0,
+                end_layer=num_layers - 1,
+                n_layers=num_layers,
+            )
+            return
+        
         logger.info("Initializing sharded inference engine...")
 
         # Create inference engine
@@ -510,12 +531,24 @@ class LLMService:
         # Update topology
         await self.network.update_topology()
 
+        # Log compute-provider topology
+        compute_topology = self.network.get_compute_provider_topology()
+        compute_nodes = compute_topology.all_nodes()
+        logger.info(f"Compute-provider nodes for sharding: {len(compute_nodes)}")
+        for nid, cap in compute_nodes:
+            logger.info(f"  {nid[:16]}... - {cap.memory}GB RAM")
+
         # Get this node's assigned shard (specific layer range for this node)
+        # This uses compute-provider-only topology for partitioning
         self.current_shard = await self.network.get_current_shard(self.base_shard)
 
         if self.current_shard:
             logger.info(f"Node assigned shard: {self.current_shard}")
-            # Load the shard
+            logger.info(
+                f"Loading only layers {self.current_shard.start_layer}-{self.current_shard.end_layer} "
+                f"out of {num_layers} total layers"
+            )
+            # Load only the assigned shard layers (unneeded layers freed automatically)
             await self.inference_engine.ensure_shard(self.current_shard)
         else:
             logger.warning("No shard assigned to this node")
@@ -700,7 +733,14 @@ class LLMService:
         )
 
     async def _init_ring_pipeline(self):
-        """Initialize ring pipeline coordinator."""
+        """Initialize ring pipeline coordinator.
+        
+        Only compute-provider nodes participate in the ring pipeline.
+        """
+        if self.network.node_role != "compute_provider":
+            logger.info("Node is inference-only, skipping ring pipeline initialization")
+            return
+            
         logger.info("Initializing ring pipeline mode...")
 
         self.ring_coordinator = RingPipelineCoordinator(
@@ -742,13 +782,16 @@ class LLMService:
         logger.info("Waiting for peer discovery...")
         await asyncio.sleep(3.0)  # Give more time for topology updates
 
-        topology_nodes = self.network.topology.all_nodes()
-        logger.info(f"Found {len(topology_nodes)} nodes in topology")
+        # Only use compute-provider nodes for the ring pipeline
+        compute_topology = self.network.get_compute_provider_topology()
+        topology_nodes = compute_topology.all_nodes()
+        logger.info(f"Found {len(topology_nodes)} compute-provider nodes for ring pipeline")
 
         if not topology_nodes:
-            logger.warning("No topology nodes found after waiting, trying again...")
+            logger.warning("No compute-provider nodes found after waiting, trying again...")
             await asyncio.sleep(2.0)
-            topology_nodes = self.network.topology.all_nodes()
+            compute_topology = self.network.get_compute_provider_topology()
+            topology_nodes = compute_topology.all_nodes()
 
         if topology_nodes:
             my_node_id = str(await self.network.iroh_node.net().node_id())
@@ -785,9 +828,10 @@ class LLMService:
         logger.info("🔄 TOPOLOGY UPDATE DETECTED - RE-INITIALIZING RING")
         logger.info("=" * 80)
 
-        # Get updated topology
-        topology_nodes = self.network.topology.all_nodes()
-        logger.info(f"New topology size: {len(topology_nodes)} nodes")
+        # Get updated topology (compute-provider nodes only)
+        compute_topology = self.network.get_compute_provider_topology()
+        topology_nodes = compute_topology.all_nodes()
+        logger.info(f"New topology size: {len(topology_nodes)} compute-provider nodes")
 
         if not topology_nodes:
             logger.warning(

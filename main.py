@@ -51,6 +51,7 @@ main_doc_id: Optional[str] = None
 
 async def message_handler(message: dict):
     """Handles incoming messages from the network."""
+    global llm_service  # Need global access for distributed load
     msg_type = message.get("type")
     sender_id = message.get("sender_id")
     payload = message.get("payload", {})
@@ -83,8 +84,9 @@ async def message_handler(message: dict):
 
             peer_capabilities = DeviceCapabilities.from_dict(peer_capabilities_dict)
             node.topology.update_node(sender_id, peer_capabilities)
+            role_str = "compute" if peer_capabilities.is_compute_provider() else "inference-only"
             console.print(
-                f"[dim]Updated topology: {sender_id[:16]}... - {peer_capabilities.memory:.1f} GB[/dim]"
+                f"[dim]Updated topology: {sender_id[:16]}... - {peer_capabilities.memory:.1f} GB ({role_str})[/dim]"
             )
 
             # Re-initialize ring pipeline if LLM service is running in ring mode
@@ -93,6 +95,23 @@ async def message_handler(message: dict):
     elif msg_type == "llm_service_info":
         llm_nodes[sender_id] = payload
         console.print(f"[magenta]LLM service discovered from {sender_id}[/magenta]")
+    elif msg_type == "llm_load_request":
+        # A node in the cluster is requesting all compute-provider nodes to load their shard
+        model_name = payload.get("model_name", "Qwen/Qwen3-0.6B")
+        if node and node.node_role == "compute_provider":
+            console.print(
+                f"[bold magenta]📦 Received LLM load request for model: {model_name}[/bold magenta]"
+            )
+            if llm_service and not llm_service.is_running:
+                console.print(f"[cyan]Loading assigned layers for {model_name}...[/cyan]")
+                asyncio.create_task(_handle_distributed_load(model_name))
+            elif llm_service and llm_service.is_running:
+                console.print("[yellow]LLM already running, broadcasting service info[/yellow]")
+                asyncio.create_task(llm_service._broadcast_service_info())
+        else:
+            console.print(
+                f"[dim]LLM load request received - skipping (inference-only node)[/dim]"
+            )
     elif msg_type == "llm_message":
         llm_payload = payload
         llm_type = llm_payload.get("llm_type")
@@ -116,6 +135,20 @@ async def message_handler(message: dict):
             msg_logger.warning(
                 f"Received query but LLM service not running (llm_service={llm_service is not None}, running={llm_service.is_running if llm_service else False})"
             )
+
+
+async def _handle_distributed_load(model_name: str):
+    """Handle a distributed load request - load this node's assigned layers."""
+    global llm_service
+    try:
+        if llm_service:
+            success = await llm_service.start(model_name)
+            if success:
+                console.print(f"[green]✅ Loaded assigned layers for {model_name}[/green]")
+            else:
+                console.print(f"[red]❌ Failed to load layers for {model_name}[/red]")
+    except Exception as e:
+        console.print(f"[red]Error loading model layers: {e}[/red]")
 
 
 async def run_node(bootstrap_ticket: Optional[str] = None, use_ring: bool = False):
@@ -146,6 +179,33 @@ async def run_node(bootstrap_ticket: Optional[str] = None, use_ring: bool = Fals
         else:
             console.print("[red]Failed to join document.[/red]")
             return
+
+    # Ask the user for their node role
+    console.print("")
+    console.print(Panel.fit(
+        "[bold cyan]Node Role Selection[/bold cyan]\n\n"
+        "[green]1.[/green] [bold]Compute Provider[/bold] - Offer this device's compute to load LLM layers\n"
+        "[green]2.[/green] [bold]Inference Only[/bold]   - Only send queries, don't load model layers",
+        border_style="blue",
+    ))
+    
+    role_choice = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: typer.prompt(
+            "Select role (1=compute, 2=inference-only)",
+            default="1",
+            prompt_suffix=" > "
+        )
+    )
+    
+    if role_choice.strip() == "2":
+        node.set_node_role("inference_only")
+        console.print("[yellow]Role: Inference Only - this node will only send queries[/yellow]")
+    else:
+        node.set_node_role("compute_provider")
+        console.print("[green]Role: Compute Provider - this node will load LLM layers[/green]")
+
+    # Broadcast topology update with role information
+    await node.broadcast_topology_update()
 
     llm_service = LLMService(node, use_sharding=True, use_ring=use_ring)
 
@@ -184,7 +244,7 @@ def display_command_menu():
         ("status", "Show node and network status"),
         ("store <key> <value>", "Store a key-value pair in the document"),
         ("get <key>", "Retrieve a value from the document"),
-        ("llm start [model_name]", "Start LLM service on this node"),
+        ("llm start [model_name]", "Start LLM across compute-provider nodes"),
         ("llm services", "List known LLM services"),
         ("llm query <prompt>", "Broadcast a query to all LLM services"),
         ("exit", "Exit the program"),
@@ -240,11 +300,21 @@ async def handle_command(args: List[str]):
     elif command == "status":
         if node and node.iroh_node:
             node_id = await node.iroh_node.net().node_id()
+            role_display = "🖥️ Compute Provider" if node.node_role == "compute_provider" else "🔍 Inference Only"
             console.print(f"[bold]My Node ID:[/bold] [yellow]{node_id}[/yellow]")
+            console.print(f"[bold]Role:[/bold] [cyan]{role_display}[/cyan]")
             if main_doc_id:
                 console.print(
                     f"[bold]Main Document ID:[/bold] [yellow]{main_doc_id}[/yellow]"
                 )
+            # Show compute-provider count
+            compute_topology = node.get_compute_provider_topology()
+            compute_nodes = compute_topology.all_nodes()
+            all_nodes = node.topology.all_nodes()
+            console.print(
+                f"[bold]Cluster nodes:[/bold] {len(all_nodes)} total, "
+                f"[green]{len(compute_nodes)} compute providers[/green]"
+            )
         else:
             console.print("[yellow]Node not started.[/yellow]")
 
@@ -278,11 +348,49 @@ async def handle_command(args: List[str]):
         if sub_command == "start":
             model_name = args[2] if len(args) > 2 else "Qwen/Qwen3-0.6B"
             console.print(f"[cyan]Starting LLM service with model: {model_name}[/cyan]")
-            success = await llm_service.start(model_name)
-            if success:
-                console.print("[green]LLM service started.[/green]")
+            
+            # Check compute-provider nodes in topology
+            compute_topology = node.get_compute_provider_topology()
+            compute_nodes = compute_topology.all_nodes()
+            
+            if not compute_nodes:
+                console.print("[red]No compute-provider nodes in the cluster![/red]")
+                console.print("[yellow]At least one node must be a compute provider.[/yellow]")
+                return
+            
+            console.print(f"[cyan]Compute-provider nodes: {len(compute_nodes)}[/cyan]")
+            for nid, cap in compute_nodes:
+                nid_short = nid[:16] if len(nid) > 16 else nid
+                console.print(f"  [dim]{nid_short}... - {cap.memory}GB RAM[/dim]")
+            
+            # If this node is a compute provider, start loading locally
+            if node.node_role == "compute_provider":
+                # Broadcast load request to other compute-provider nodes first
+                load_request = {
+                    "type": "llm_load_request",
+                    "sender_id": str(await node.iroh_node.net().node_id()),
+                    "payload": {"model_name": model_name},
+                    "timestamp": time.time(),
+                }
+                await node.broadcast_message(load_request)
+                
+                # Now start loading our own shard
+                success = await llm_service.start(model_name)
+                if success:
+                    console.print("[green]LLM service started.[/green]")
+                else:
+                    console.print("[red]Failed to start LLM service.[/red]")
             else:
-                console.print("[red]Failed to start LLM service.[/red]")
+                # Inference-only node: broadcast load request to compute-providers
+                console.print("[cyan]Broadcasting load request to compute-provider nodes...[/cyan]")
+                load_request = {
+                    "type": "llm_load_request",
+                    "sender_id": str(await node.iroh_node.net().node_id()),
+                    "payload": {"model_name": model_name},
+                    "timestamp": time.time(),
+                }
+                await node.broadcast_message(load_request)
+                console.print("[green]Load request sent to cluster. Compute-provider nodes will load their layers.[/green]")
 
         elif sub_command == "services":
             table = Table(title="LLM Services")

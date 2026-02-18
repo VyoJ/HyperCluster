@@ -800,15 +800,22 @@ class TransformersShardedInferenceEngine(InferenceEngine):
 
     def _wrap_model_in_shard(self, model, shard: Shard):
         """
-        Wrap model to only execute assigned layers.
+        Wrap model to only execute assigned layers and free unneeded layers.
 
         Uses the TransformersShard wrapper to extract and execute only
-        the layers assigned to this shard.
+        the layers assigned to this shard. After wrapping, frees all
+        unneeded layers from memory so only the assigned layers remain.
         """
         from sharded_model import TransformersShard
 
         logger.info(f"Wrapping model in shard: {shard}")
-        return TransformersShard(model, shard)
+        sharded = TransformersShard(model, shard)
+        
+        # Free unneeded layers to reduce memory usage
+        # This is critical for large models that don't fit on one device
+        sharded.free_unneeded_layers()
+        
+        return sharded
 
     def _create_device_map_for_shard(self, shard: Shard) -> Union[str, Dict[str, Any]]:
         """Create device map for the specific shard."""

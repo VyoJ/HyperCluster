@@ -103,6 +103,84 @@ class TransformersShard:
             f"Initialized {self.model_type} shard with layers {self.start_layer}-{self.end_layer}/{self.total_layers}"
         )
 
+    def free_unneeded_layers(self):
+        """
+        Free memory used by layers NOT assigned to this shard.
+        
+        After calling _extract_model_components(), self.layers holds only the
+        needed layers. This method removes all other layers from the base model
+        to free memory, which is critical for large models that don't fit 
+        entirely in one device's memory.
+        """
+        import gc
+        
+        # Get the inner model
+        if hasattr(self.base_model, "model"):
+            inner_model = self.base_model.model
+        elif hasattr(self.base_model, "transformer"):
+            inner_model = self.base_model.transformer
+        else:
+            logger.warning("Cannot find inner model to free layers")
+            return
+        
+        # Get the layer container
+        if hasattr(inner_model, "layers"):
+            all_layers = inner_model.layers
+        elif hasattr(inner_model, "h"):
+            all_layers = inner_model.h
+        elif hasattr(inner_model, "decoder") and hasattr(inner_model.decoder, "layers"):
+            all_layers = inner_model.decoder.layers
+        else:
+            logger.warning("Cannot find layers container to free")
+            return
+        
+        # Replace unneeded layers with None to free memory
+        freed_count = 0
+        for i in range(len(all_layers)):
+            if i < self.start_layer or i > self.end_layer:
+                all_layers[i] = None
+                freed_count += 1
+        
+        # Free embeddings if not first shard
+        if not self.shard.is_first_layer():
+            if hasattr(inner_model, "embed_tokens"):
+                inner_model.embed_tokens = None
+            elif hasattr(inner_model, "wte"):
+                inner_model.wte = None
+            elif hasattr(inner_model, "word_embeddings"):
+                inner_model.word_embeddings = None
+            logger.info("Freed embedding layer (not first shard)")
+        
+        # Free LM head and final norm if not last shard
+        if not self.shard.is_last_layer():
+            if hasattr(self.base_model, "lm_head"):
+                self.base_model.lm_head = None
+            elif hasattr(self.base_model, "embed_out"):
+                self.base_model.embed_out = None
+            
+            if hasattr(inner_model, "norm"):
+                inner_model.norm = None
+            elif hasattr(inner_model, "ln_f"):
+                inner_model.ln_f = None
+            elif hasattr(inner_model, "final_layernorm"):
+                inner_model.final_layernorm = None
+            logger.info("Freed LM head and final norm (not last shard)")
+        
+        # Force garbage collection
+        gc.collect()
+        
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+        
+        logger.info(
+            f"Freed {freed_count} unneeded layers from memory "
+            f"(keeping layers {self.start_layer}-{self.end_layer})"
+        )
+
     def _get_total_layers(self) -> int:
         """Get the total number of layers in the model."""
         # Different models store layer count differently
