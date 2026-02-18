@@ -63,6 +63,9 @@ class Node:
         self._gossip_topic: Optional[bytes] = None
         self._protocol_creator: Optional[HyperClusterProtocolCreator] = None
 
+        # Compute offering: whether this node is willing to load LLM layers
+        self.offers_compute: bool = False
+
     async def start(self):
         """Start the Iroh node."""
         try:
@@ -534,11 +537,46 @@ class Node:
             "payload": {
                 "capabilities": self.device_capabilities.to_dict(),
                 "topology": self.topology.to_json(),
+                "offers_compute": self.offers_compute,
             },
             "timestamp": time.time(),
         }
 
         await self.broadcast_message(message)
+
+    async def set_compute_offering(self, offers: bool):
+        """Set and broadcast whether this node offers compute for LLM inference."""
+        self.offers_compute = offers
+        node_id = str(await self.iroh_node.net().node_id())
+        self.topology.set_compute_offering(node_id, offers)
+        logger.info(f"Compute offering set to: {offers}")
+        await self.broadcast_topology_update()
+
+    async def get_compute_shards(self, base_shard) -> Dict[str, Any]:
+        """
+        Compute shard assignments for all compute-offering nodes.
+
+        Returns:
+            Dict mapping node_id to their assigned Shard
+        """
+        compute_nodes = self.topology.get_compute_nodes()
+        if not compute_nodes:
+            return {}
+
+        # Build a temporary topology with only compute nodes
+        compute_topology = Topology()
+        for nid, cap in compute_nodes:
+            compute_topology.update_node(nid, cap)
+
+        partitions = self.partitioning_strategy.partition(compute_topology)
+        shards = map_partitions_to_shards(
+            partitions, base_shard.n_layers, base_shard.model_id
+        )
+
+        return {
+            partitions[i].node_id: shards[i]
+            for i in range(len(partitions))
+        }
 
     # ===== Direct Transport Methods (lattica-style QUIC) =====
 

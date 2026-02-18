@@ -83,8 +83,14 @@ async def message_handler(message: dict):
 
             peer_capabilities = DeviceCapabilities.from_dict(peer_capabilities_dict)
             node.topology.update_node(sender_id, peer_capabilities)
+
+            # Track compute offering from this peer
+            offers_compute = payload.get("offers_compute", False)
+            node.topology.set_compute_offering(sender_id, offers_compute)
+
+            compute_status = "offers compute" if offers_compute else "inference only"
             console.print(
-                f"[dim]Updated topology: {sender_id[:16]}... - {peer_capabilities.memory:.1f} GB[/dim]"
+                f"[dim]Updated topology: {sender_id[:16]}... - {peer_capabilities.memory:.1f} GB - {compute_status}[/dim]"
             )
 
             # Re-initialize ring pipeline if LLM service is running in ring mode
@@ -93,6 +99,19 @@ async def message_handler(message: dict):
     elif msg_type == "llm_service_info":
         llm_nodes[sender_id] = payload
         console.print(f"[magenta]LLM service discovered from {sender_id}[/magenta]")
+    elif msg_type == "llm_load_shard":
+        # Another node initiated `llm start` and assigned us a shard to load
+        if node and llm_service:
+            shard_info = payload.get("shard", {})
+            model_name = payload.get("model_name", "")
+            use_ring = payload.get("use_ring", True)
+            console.print(
+                f"[bold magenta]Received shard assignment from {sender_id[:16]}...: "
+                f"model={model_name}, layers {shard_info.get('start_layer')}-{shard_info.get('end_layer')}[/bold magenta]"
+            )
+            asyncio.create_task(
+                llm_service.load_assigned_shard(model_name, shard_info, use_ring)
+            )
     elif msg_type == "llm_message":
         llm_payload = payload
         llm_type = llm_payload.get("llm_type")
@@ -159,6 +178,24 @@ async def run_node(bootstrap_ticket: Optional[str] = None, use_ring: bool = Fals
         f"[dim]📝 Logging to: {log_filename.absolute()}[/dim]"
     )
 
+    # Ask user whether to offer compute for LLM layer loading
+    compute_choice = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: typer.confirm(
+            "\nOffer this node's compute for loading LLM layers?",
+            default=True,
+        ),
+    )
+    await node.set_compute_offering(compute_choice)
+    if compute_choice:
+        console.print(
+            "[bold green]✓ This node will participate in loading LLM layers[/bold green]"
+        )
+    else:
+        console.print(
+            "[yellow]This node will only send inference queries (no layer loading)[/yellow]"
+        )
+
     while True:
         display_command_menu()
         cmd = await asyncio.get_event_loop().run_in_executor(
@@ -184,8 +221,8 @@ def display_command_menu():
         ("status", "Show node and network status"),
         ("store <key> <value>", "Store a key-value pair in the document"),
         ("get <key>", "Retrieve a value from the document"),
-        ("llm start [model_name]", "Start LLM service on this node"),
-        ("llm services", "List known LLM services"),
+        ("llm start [model_name]", "Start LLM across all compute-offering nodes"),
+        ("llm services", "List known LLM services and compute nodes"),
         ("llm query <prompt>", "Broadcast a query to all LLM services"),
         ("exit", "Exit the program"),
     ]
@@ -245,6 +282,16 @@ async def handle_command(args: List[str]):
                 console.print(
                     f"[bold]Main Document ID:[/bold] [yellow]{main_doc_id}[/yellow]"
                 )
+            compute_status = "Yes" if node.offers_compute else "No"
+            console.print(f"[bold]Offers Compute:[/bold] [yellow]{compute_status}[/yellow]")
+
+            # Show compute-offering nodes
+            compute_nodes = node.topology.get_compute_nodes()
+            if compute_nodes:
+                console.print(f"[bold]Compute Nodes:[/bold] [yellow]{len(compute_nodes)}[/yellow]")
+                for nid, cap in compute_nodes:
+                    marker = " (me)" if str(node_id) == nid else ""
+                    console.print(f"  [dim]{nid[:16]}... - {cap.memory:.1f} GB{marker}[/dim]")
         else:
             console.print("[yellow]Node not started.[/yellow]")
 

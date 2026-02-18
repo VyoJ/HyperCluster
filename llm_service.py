@@ -20,6 +20,8 @@ class LLMMessageType(Enum):
     RESPONSE = "response"
     SERVICE_INFO = "service_info"
     STATUS = "status"
+    LOAD_SHARD = "load_shard"
+    SHARD_LOADED = "shard_loaded"
 
 
 class LLMService:
@@ -71,7 +73,16 @@ class LLMService:
         self, model_name: Optional[str] = None, num_layers: Optional[int] = None
     ):
         """
-        Start the LLM service by loading the model.
+        Start the LLM service by computing shard assignments across compute nodes
+        and loading only this node's assigned layers.
+
+        This method orchestrates distributed loading:
+        1. Auto-detect model layers
+        2. Get all compute-offering nodes from topology
+        3. Compute weighted shard assignments
+        4. Send LOAD_SHARD to other compute nodes
+        5. Load this node's own shard (if it offers compute)
+        6. Initialize ring pipeline
 
         Args:
             model_name: Optional model name to override default
@@ -492,7 +503,11 @@ class LLMService:
     # ===== Sharded Inference Methods =====
 
     async def _init_sharded_inference(self, num_layers: int):
-        """Initialize sharded inference engine and determine this node's shard."""
+        """Initialize sharded inference engine and determine this node's shard.
+        
+        Uses compute-offering nodes for shard partitioning. Sends LOAD_SHARD
+        messages to other compute nodes so they load their assigned layers.
+        """
         logger.info("Initializing sharded inference engine...")
 
         # Create inference engine
@@ -510,15 +525,125 @@ class LLMService:
         # Update topology
         await self.network.update_topology()
 
-        # Get this node's assigned shard (specific layer range for this node)
-        self.current_shard = await self.network.get_current_shard(self.base_shard)
+        # Get shard assignments for all compute-offering nodes
+        compute_shards = await self.network.get_compute_shards(self.base_shard)
+        my_node_id = str(await self.network.iroh_node.net().node_id())
 
-        if self.current_shard:
-            logger.info(f"Node assigned shard: {self.current_shard}")
-            # Load the shard
+        if not compute_shards:
+            # No compute nodes found — fall back to loading on this node only
+            logger.warning("No compute-offering nodes found, loading full model on this node")
+            self.current_shard = await self.network.get_current_shard(self.base_shard)
+            if self.current_shard:
+                logger.info(f"Node assigned shard (fallback): {self.current_shard}")
+                await self.inference_engine.ensure_shard(self.current_shard)
+            else:
+                logger.warning("No shard assigned to this node")
+            return
+
+        logger.info(f"Computed shard assignments for {len(compute_shards)} compute nodes:")
+        for nid, shard in compute_shards.items():
+            marker = " (me)" if nid == my_node_id else ""
+            logger.info(f"  {nid[:16]}...{marker}: layers {shard.start_layer}-{shard.end_layer}")
+
+        # Send LOAD_SHARD to other compute nodes
+        for target_node_id, shard in compute_shards.items():
+            if target_node_id != my_node_id:
+                logger.info(f"Sending LOAD_SHARD to {target_node_id[:16]}...")
+                load_msg = {
+                    "type": "llm_load_shard",
+                    "sender_id": my_node_id,
+                    "payload": {
+                        "model_name": self.model_name,
+                        "shard": shard.to_dict(),
+                        "use_ring": self.use_ring,
+                    },
+                    "timestamp": time.time(),
+                }
+                await self.network.broadcast_message(load_msg)
+
+        # Load our own shard (if this node offers compute)
+        if my_node_id in compute_shards:
+            self.current_shard = compute_shards[my_node_id]
+            logger.info(f"Loading own shard: {self.current_shard}")
             await self.inference_engine.ensure_shard(self.current_shard)
         else:
-            logger.warning("No shard assigned to this node")
+            # This node doesn't offer compute — it won't load any layers
+            # but can still send queries to the ring
+            logger.info("This node does not offer compute, no layers to load")
+            self.current_shard = self.base_shard  # Keep base shard for reference
+
+    async def load_assigned_shard(
+        self, model_name: str, shard_dict: dict, use_ring: bool = True
+    ):
+        """
+        Load a specific shard assigned by a coordinator node.
+
+        Called when this node receives an llm_load_shard message from
+        another node that initiated `llm start`.
+
+        Args:
+            model_name: Model to load
+            shard_dict: Shard specification as dict
+            use_ring: Whether to enable ring pipeline mode
+        """
+        if self.is_loading or self.is_loaded:
+            logger.warning("LLM already loading or loaded, ignoring shard assignment")
+            return False
+
+        self.is_loading = True
+        self.model_name = model_name
+        self.use_ring = use_ring
+        self.is_bitnet = "bitnet" in model_name.lower()
+
+        try:
+            # Auto-detect total layers
+            from transformers import AutoConfig
+            config = AutoConfig.from_pretrained(self.model_name)
+            if hasattr(config, "num_hidden_layers"):
+                self.num_layers = config.num_hidden_layers
+            elif hasattr(config, "n_layer"):
+                self.num_layers = config.n_layer
+            elif hasattr(config, "num_layers"):
+                self.num_layers = config.num_layers
+            else:
+                raise ValueError(f"Cannot determine number of layers for {self.model_name}")
+
+            # Create base shard
+            self.base_shard = Shard(
+                model_id=self.model_name,
+                start_layer=0,
+                end_layer=self.num_layers - 1,
+                n_layers=self.num_layers,
+            )
+
+            # Create inference engine and load the assigned shard
+            self.inference_engine = TransformersShardedInferenceEngine()
+            self.current_shard = Shard(
+                model_id=shard_dict["model_id"],
+                start_layer=shard_dict["start_layer"],
+                end_layer=shard_dict["end_layer"],
+                n_layers=shard_dict["n_layers"],
+            )
+
+            logger.info(f"Loading assigned shard: {self.current_shard}")
+            await self.inference_engine.ensure_shard(self.current_shard)
+
+            self.is_loaded = True
+            self.is_running = True
+            self.is_loading = False
+
+            # Initialize ring pipeline
+            if self.use_ring:
+                await self._init_ring_pipeline()
+
+            await self._broadcast_service_info()
+            logger.info(f"Loaded assigned shard successfully: {self.current_shard}")
+            return True
+
+        except Exception as e:
+            self.is_loading = False
+            logger.error(f"Failed to load assigned shard: {e}", exc_info=True)
+            return False
 
     async def _process_query_sharded(self, query_id: str, query: str):
         """Process query using sharded inference."""

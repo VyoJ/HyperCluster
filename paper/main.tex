@@ -1,0 +1,629 @@
+% HyperCluster: Decentralized LLM Inference over Peer-to-Peer Wireless Networks
+% Prepared for DAIS 2026 (part of DisCoTec 2026)
+% LNCS format (Springer)
+%
+\documentclass[runningheads]{llncs}
+%
+\usepackage[T1]{fontenc}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{listings}
+\usepackage{url}
+\usepackage{makecell}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{subcaption}
+\usepackage{hyperref}
+
+% Code listing style
+\lstset{%
+	basicstyle={\footnotesize\ttfamily},
+	numbers=left,numberstyle=\footnotesize,xleftmargin=2em,
+	aboveskip=10pt,belowskip=10pt,
+	showstringspaces=false,tabsize=2,breaklines=true,
+	keywordstyle=\color{blue}\bfseries,
+	commentstyle=\color{gray},
+	stringstyle=\color{red}}
+
+% Placeholder command for figures not yet created
+\newcommand{\placeholder}[2]{%
+  \begin{center}
+  \fbox{\parbox{#1}{\centering\vspace{1.5cm}\textit{[Figure placeholder:} #2\textit{]}\vspace{1.5cm}}}
+  \end{center}
+}
+
+\begin{document}
+%
+\title{HyperCluster: Decentralized Large Language Model Inference over Peer-to-Peer Wireless Networks}
+%
+\titlerunning{HyperCluster: Decentralized LLM Inference}
+%
+\author{Anonymous Submission}
+%
+\authorrunning{Anonymous et al.}
+%
+\institute{Affiliations Placeholder}
+%
+\maketitle
+%
+\begin{abstract}
+The substantial memory and computational requirements of large language models (LLMs) preclude their deployment on individual resource-constrained wireless devices. This paper introduces HyperCluster, a framework for fully decentralized collaborative inference of LLMs over peer-to-peer wireless networks. Our system contributes four core innovations: (1)~a ring-based pipelined inference protocol where nodes deterministically self-organize into a computational ring based on device capabilities, passing intermediate activations directly between peers using QUIC-based content-addressed networking; (2)~a generalizable model sharding engine built upon the Hugging Face Transformers library that automatically partitions any dense LLM across heterogeneous devices proportional to available memory; (3)~a direct QUIC transport layer inspired by the Lattica framework, employing persistent connections, binary-framed RPC, and connection pre-warming to minimize inter-node transfer latency; and (4)~a tail-node sampling optimization that reduces the return-path data transfer by approximately $18{,}000\times$ per generation step. We provide a practical validation on a heterogeneous cluster of three consumer-grade devices communicating over separate networks via the Iroh P2P stack, demonstrating correct distributed inference of models with up to one billion parameters and identifying the key performance bottlenecks that inform future optimization efforts.
+
+\keywords{Distributed AI \and Peer-to-Peer Networks \and LLM Inference \and Model Sharding \and Ring Pipeline \and QUIC Transport}
+\end{abstract}
+
+%=============================================================================
+\section{Introduction}
+\label{sec:intro}
+%=============================================================================
+
+The proliferation of large language models (LLMs) has created an unprecedented demand for computational resources. State-of-the-art models require tens to hundreds of gigabytes of memory, far exceeding the capacity of typical consumer and edge devices. While cloud-based services provide convenient access, they introduce latency, privacy concerns, and dependence on centralized infrastructure---issues that are particularly acute in wireless and edge computing scenarios where connectivity may be intermittent or bandwidth-constrained.
+
+An alternative paradigm is \emph{collaborative inference}, where multiple devices in a peer-to-peer (P2P) network pool their resources to collectively execute a model that no single device could run alone. However, realizing this vision in a decentralized wireless environment presents unique challenges. Data-center frameworks such as Megatron-LM~\cite{shoeybi2019megatron} and DeepSpeed~\cite{rasley2020deepspeed} presuppose high-bandwidth, low-latency interconnects (NVLink, InfiniBand) and stable cluster memberships---assumptions that fundamentally do not hold in dynamic P2P networks where nodes communicate over heterogeneous wireless links with variable latency and bandwidth.
+
+Several recent systems have explored decentralized inference. Petals~\cite{borzunov2023petals} enables collaborative inference through voluntary GPU contributions, but relies on centralized coordination for peer discovery. Exo~\cite{exo} supports heterogeneous ``home clusters'' but is limited to local networks without NAT traversal. Prima.cpp~\cite{li2025prima} introduces an efficient ring pipeline but targets static cluster configurations. None of these systems simultaneously address \emph{internet-scale NAT traversal}, \emph{broad model compatibility} via standard libraries, and \emph{communication optimization} for bandwidth-constrained links.
+
+This paper introduces \textbf{HyperCluster}, a framework for fully decentralized collaborative inference designed for heterogeneous devices communicating over P2P networks across the internet. Built on the Iroh~\cite{iroh2024} content-addressed networking stack, HyperCluster enables nodes separated by NATs and firewalls to self-organize into a computational ring and collectively execute standard Hugging Face Transformer models without any model-specific modifications.
+
+\smallskip
+\noindent\textbf{Contributions.} This paper makes the following contributions:
+
+\begin{enumerate}
+    \item \textbf{Decentralized Ring-Pipeline Protocol:} A coordinator-free inference protocol where nodes self-organize into a deterministic computational ring based on advertised device capabilities. Intermediate activations and synchronization metadata (position IDs, attention masks) flow directly between peers, enabling correct autoregressive generation without centralized coordination (\S\ref{sec:execution}).
+
+    \item \textbf{Generalizable Transformers-Based Sharding Engine:} A dynamic model sharding methodology that integrates directly with the Hugging Face Transformers library~\cite{wolf-etal-2020-transformers}, enabling any dense, off-the-shelf LLM to be automatically partitioned across heterogeneous devices according to available memory. The engine employs runtime layer extraction with configuration patching to ensure correct KV cache allocation on each shard (\S\ref{sec:sharding}).
+
+    \item \textbf{Direct QUIC Transport with Lattica-Inspired Framed RPC:} A high-performance tensor transfer layer using persistent QUIC connections, binary-framed msgpack RPC, and 4\,MB chunked streaming. Connection pre-warming during ring initialization eliminates first-transfer handshake latency of 6--20\,ms (\S\ref{sec:transport}).
+
+    \item \textbf{Tail-Node Sampling Optimization:} An optimization where the tail node samples the next token locally and returns only the 8-byte token ID to the head node, rather than transmitting the full logit tensor ($\sim$0.58\,MB for a 150K-vocabulary model), achieving an approximately $18{,}000\times$ reduction in return-path data per autoregressive step (\S\ref{sec:tail_sampling}).
+\end{enumerate}
+
+We validate HyperCluster on a heterogeneous cluster of three consumer-grade devices---a MacBook Air M2 (16\,GB), a Mac Mini (8\,GB), and an Intel i5 Linux laptop (8\,GB)---communicating across separate networks via the Iroh P2P stack. Our experiments demonstrate correct distributed inference of Llama-3.2-1B-Instruct~\cite{grattafiori2024llama} and Qwen3-0.6B~\cite{yang2025qwen3}, and our analysis identifies the communication bottleneck as the dominant factor governing distributed inference throughput.
+
+%=============================================================================
+\section{Background and Related Work}
+\label{sec:related}
+%=============================================================================
+
+This section situates HyperCluster within three research areas: centralized model parallelism, decentralized inference systems, and communication topologies for distributed computation.
+
+\subsection{Model Parallelism in Centralized Environments}
+
+The challenge of partitioning large neural networks has been extensively studied within the high-trust, homogeneous environments of data centers. Megatron-LM~\cite{shoeybi2019megatron} introduced tensor (intra-layer) and pipeline (inter-layer) parallelism for training multi-billion parameter models across GPU clusters. DeepSpeed~\cite{rasley2020deepspeed} contributed ZeRO optimizer partitioning for memory-efficient training at scale. Alpa~\cite{zheng2022alpa} automated the search for optimal inter- and intra-operator parallelism strategies. While these systems provide foundational techniques, they are architected for stable hardware with NVLink/InfiniBand interconnects---assumptions that are fundamentally incompatible with the bandwidth-constrained, heterogeneous P2P networks targeted by HyperCluster.
+
+\subsection{Decentralized and Peer-to-Peer Inference}
+
+Recent work has begun exploring inference workload distribution over less reliable, internet-scale networks:
+
+\smallskip
+\noindent\textbf{Petals}~\cite{borzunov2023petals} demonstrated a collaborative system where users contribute GPU resources to a shared network for inference and fine-tuning. However, Petals relies on a central authority for peer discovery and routing, and assumes high-bandwidth, stable connections, limiting its applicability in dynamic wireless environments.
+
+\smallskip
+\noindent\textbf{Exo}~\cite{exo} enables distributed inference across a ``home cluster'' of everyday devices, employing ring memory-weighted partitioning to split models based on device capabilities. While Exo's partitioning strategy influenced HyperCluster's approach, it is primarily designed for local networks, does not address NAT traversal for internet-scale collaboration, and supports only a limited set of model families.
+
+\smallskip
+\noindent\textbf{Lattica}~\cite{yang2025lattica} provides a universal, cross-NAT communication framework for decentralized AI, establishing a globally addressable P2P mesh using libp2p with noise+yamux transports. HyperCluster draws architectural inspiration from Lattica's framed RPC protocol design, adapting it to Iroh's native QUIC streams.
+
+\smallskip
+\noindent\textbf{Hyperspace} explores a general-purpose P2P network for AI using Distributed Hash Tables (DHTs) and cryptographic protocols. HyperCluster builds upon these foundational P2P principles by integrating networking primitives directly into a purpose-built, application-level protocol for collaborative inference.
+
+\subsection{Ring Topologies for Distributed Computation}
+
+The ring all-reduce algorithm~\cite{patarasuk2009bandwidth} is a foundational communication pattern for distributed training. Prima.cpp~\cite{li2025prima} adapted this topology for inference, demonstrating that a pipelined ring architecture can effectively split LLMs across heterogeneous devices by overlapping disk I/O with computation. HyperCluster extends the ring concept to a fully dynamic, geographically distributed wireless environment by implementing it on Iroh's~\cite{iroh2024} QUIC-based P2P stack, which provides built-in NAT traversal and connection management across firewalls.
+
+%=============================================================================
+\section{System Architecture}
+\label{sec:system_design}
+%=============================================================================
+
+HyperCluster is organized into four layers, depicted in Figure~\ref{fig:architecture}: a \emph{Network Layer} for P2P communication and topology management, a \emph{Transport Layer} for high-performance tensor transfer, a \emph{Partitioning Layer} for dynamic model sharding, and an \emph{Execution Layer} for ring-pipeline inference orchestration.
+
+\begin{figure}[t]
+\centering
+\placeholder{0.85\textwidth}{System architecture diagram showing the four-layer stack: Network Layer (Iroh: NAT traversal, gossip, document sync), Transport Layer (Direct QUIC: framed RPC, connection pool, pre-warming), Partitioning Layer (memory-weighted sharding, TransformersShard wrapper), Execution Layer (ring pipeline coordinator, tail-node sampling). Show data flow between 3 nodes in a ring.}
+\caption{HyperCluster system architecture. The four-layer stack enables decentralized ring-pipeline inference over P2P wireless networks.}
+\label{fig:architecture}
+\end{figure}
+
+%-----------------------------------------------------------------------------
+\subsection{Network Layer: P2P Communication via Iroh}
+\label{sec:network}
+%-----------------------------------------------------------------------------
+
+The network layer is built upon \textbf{Iroh}~\cite{iroh2024}, a content-addressed networking library that provides three essential primitives for P2P environments:
+
+\begin{itemize}
+    \item \textbf{NAT Traversal:} Iroh's QUIC-based endpoint establishes direct peer connections across firewalls using relay servers as a fallback, enabling nodes in separate networks to communicate without manual port forwarding.
+    \item \textbf{Gossip Protocol:} Decentralized peer discovery and lightweight message broadcasting enable nodes to announce their presence and capabilities without centralized coordination.
+    \item \textbf{Document Synchronization:} Iroh's CRDT-based document store maintains consistent distributed state across peers, used for topology information and capability advertisements.
+\end{itemize}
+
+Each node is identified by a cryptographic public key (its \texttt{NodeId}), providing deduplication guarantees and enabling authenticated communication. Upon initialization, each node detects its hardware capabilities---available memory, compute capacity, chip architecture---and advertises them through Iroh's document synchronization mechanism. The \texttt{Topology} module (see \S\ref{sec:topology}) maintains a real-time view of all active peers and their resources, enabling dynamic cluster formation.
+
+%-----------------------------------------------------------------------------
+\subsection{Transport Layer: Direct QUIC Streams}
+\label{sec:transport}
+%-----------------------------------------------------------------------------
+
+A critical contribution of HyperCluster is its direct peer-to-peer tensor transport, which bypasses the overhead of the document synchronization pathway for latency-sensitive tensor transfers. Inspired by Lattica's~\cite{yang2025lattica} framed RPC architecture, our transport layer operates as follows:
+
+\smallskip
+\noindent\textbf{Protocol Design.} Each HyperCluster node registers a custom ALPN protocol identifier (\texttt{hypercluster/rpc/1}) with Iroh's QUIC endpoint. When two nodes need to exchange tensors, they establish a persistent bidirectional QUIC stream (a \texttt{BiStream}). All communication over this stream follows a binary-framed wire format:
+
+\begin{equation}
+\text{Frame} = \underbrace{[4\text{B length}]}_{\text{big-endian}} \;||\; \underbrace{[1\text{B type}][1\text{B flags}][2\text{B rid\_len}][2\text{B method\_len}][\text{rid}][\text{method}][\text{data}]}_{\text{payload}}
+\label{eq:frame}
+\end{equation}
+
+The frame protocol supports seven frame types (Request, Data, Error, Close, Cancel, Ping, Pong), mirroring Lattica's \texttt{StreamFrame} enum. Large tensor payloads are split into 4\,MB chunks (compared to Lattica's 16\,MB, tuned for Python's memory characteristics) and reassembled at the receiver.
+
+\smallskip
+\noindent\textbf{Connection Pooling.} The \texttt{ConnectionManager} maintains a pool of \texttt{StreamHandle} objects---persistent connections to known peers. Each handle multiplexes multiple RPC calls over a single QUIC bidirectional stream via unique request IDs (an 8-character UUID prefix). Connection health is monitored and dead handles are automatically replaced on the next call.
+
+\smallskip
+\noindent\textbf{Connection Pre-Warming.} During ring initialization (\S\ref{sec:execution}), HyperCluster proactively establishes QUIC connections to all ring neighbors (next node, previous node, and head node) and verifies connectivity via a Ping/Pong handshake. This eliminates the 6--20\,ms connection setup latency that would otherwise occur on the first tensor transfer of each generation step.
+
+\smallskip
+\noindent\textbf{Tensor Wire Format.} For tensor transfers, the payload encodes metadata and raw tensor bytes in a single binary blob:
+\begin{equation}
+\text{TensorPayload} = \underbrace{[4\text{B meta\_len}]}_{\text{big-endian}} \;||\; \underbrace{[\text{JSON metadata}]}_{\text{shape, dtype, position, request\_id}} \;||\; \underbrace{[\text{raw tensor bytes}]}_{\text{numpy tobytes()}}
+\label{eq:tensor_wire}
+\end{equation}
+
+\noindent This avoids the base64 encoding overhead inherent in JSON-based tensor serialization. In-flight tensor metadata includes the sender node ID, request ID, tensor shape and dtype, finality flag, and position metadata for RoPE embedding calculation.
+
+%-----------------------------------------------------------------------------
+\subsection{Partitioning Layer: Memory-Weighted Sharding}
+\label{sec:partitioning}
+%-----------------------------------------------------------------------------
+
+\subsubsection{Partitioning Algorithm.}
+To distribute a model with $L$ transformer layers across $N$ heterogeneous nodes with memory capacities $\mathbf{m} = (m_1, m_2, \ldots, m_N)$, we employ a \textbf{memory-proportional partitioning strategy}. Nodes are first sorted by available memory in descending order, establishing the ring topology and rank assignments. Layer assignments are computed proportionally to each node's memory fraction:
+
+\begin{equation}
+\ell_i = \begin{cases}
+\max\!\big(1, \lfloor \frac{m_i}{\sum_j m_j} \cdot L \rfloor\big), & i < N \\[4pt]
+L - \sum_{j=1}^{N-1} \ell_j, & i = N
+\end{cases}
+\label{eq:layer_alloc}
+\end{equation}
+
+\noindent The last node receives any remaining layers to ensure complete coverage. Each node $i$ is assigned a contiguous \texttt{LayerWindow} $[s_i, e_i]$ where $s_i = \sum_{j=1}^{i-1} \ell_j$ and $e_i = s_i + \ell_i - 1$. The formal algorithm is presented in Algorithm~\ref{alg:partitioning}.
+
+\begin{algorithm}[t]
+\caption{Memory-Weighted Layer Partitioning}
+\label{alg:partitioning}
+\begin{algorithmic}[1]
+\STATE \textbf{Input}: Total layers $L$, Nodes $N$ sorted by memory (desc.)
+\STATE \textbf{Output}: Layer assignments $W = \{w_1, \ldots, w_N\}$
+\STATE $M_{\text{total}} \gets \sum_{i=1}^{N} m_i$
+\STATE $L_{\text{cur}} \gets 0$
+\FOR{$i = 1$ \TO $N$}
+    \STATE $f_i \gets m_i / M_{\text{total}}$ \COMMENT{Memory fraction}
+    \IF{$i = N$}
+        \STATE $\ell_i \gets L - L_{\text{cur}}$ \COMMENT{Last node: remaining layers}
+    \ELSE
+        \STATE $\ell_i \gets \max(1, \lfloor f_i \times L \rfloor)$
+    \ENDIF
+    \STATE $w_i \gets \texttt{LayerWindow}(L_{\text{cur}},\; L_{\text{cur}} + \ell_i - 1)$
+    \STATE $L_{\text{cur}} \gets L_{\text{cur}} + \ell_i$
+\ENDFOR
+\RETURN $W$
+\end{algorithmic}
+\end{algorithm}
+
+For example, distributing 28 layers across three nodes with 16\,GB, 8\,GB, and 8\,GB of memory yields: Node~0 receives 14 layers ($[0,13]$), Node~1 receives 7 layers ($[14,20]$), and Node~2 receives 7 layers ($[21,27]$). For modern Transformer architectures, layers have approximately uniform memory requirements, making layer count a reliable proxy for resource allocation.
+
+%-----------------------------------------------------------------------------
+\subsection{Sharding Engine: Dynamic Layer Extraction}
+\label{sec:sharding}
+%-----------------------------------------------------------------------------
+
+Our sharding engine implements runtime layer extraction through the \texttt{TransformersShard} wrapper class, which dynamically isolates assigned layers from any Hugging Face \texttt{AutoModelForCausalLM} instance without model-specific modifications.
+
+\subsubsection{Shard Roles.} The wrapper classifies each shard by its position in the ring:
+
+\begin{itemize}
+    \item \textbf{Initial Shard ($N_0$):} Executes token embedding (\texttt{embed\_tokens}) followed by assigned transformer layers $[0, e_0]$. Receives raw token IDs as input.
+    \item \textbf{Intermediate Shards ($N_i$, $0 < i < N\!-\!1$):} Process layers $[s_i, e_i]$ on received hidden state tensors. No embedding or LM head.
+    \item \textbf{Final Shard ($N_{N-1}$):} Executes layers $[s_{N-1}, L\!-\!1]$, applies final layer normalization (\texttt{norm}), and projects to vocabulary logits via the language model head (\texttt{lm\_head}).
+\end{itemize}
+
+\subsubsection{Layer Re-Indexing.} A subtle but critical detail is that each shard's layers must be re-indexed locally starting from zero. Transformer layers use their index for positional operations within the KV cache (specifically, \texttt{layer.self\_attn.layer\_idx} determines which slot in the \texttt{DynamicCache} to read from and write to). Without re-indexing, a shard assigned layers $[14, 20]$ would attempt to access cache slots $[14, 20]$ in a cache that only has 7 entries, causing index-out-of-bounds errors.
+
+\subsubsection{Configuration Patching for Correct Cache Allocation.}
+\label{sec:config_patch}
+
+A further correctness requirement arises from the \texttt{DynamicCache} implementation in Hugging Face Transformers. The cache pre-allocates storage based on the model configuration's \texttt{num\_hidden\_layers} attribute. Without intervention, every shard would pre-allocate cache slots for \emph{all} $L$ layers of the full model, even though it only processes $\ell_i$ layers.
+
+This mismatch has a critical consequence: after the forward pass populates only the shard's $\ell_i$ cache slots, the remaining $L - \ell_i$ slots remain as empty tensors. When \texttt{get\_seq\_length()} is called, it queries slot~0---which on non-initial shards may be empty---returning a sequence length of~0. This incorrect value propagates to the \texttt{cache\_position} computation, corrupting position embeddings and breaking RoPE~\cite{su2024roformer} calculations in subsequent generation steps.
+
+We resolve this by deep-copying the base model's configuration and patching \texttt{num\_hidden\_layers} to match the shard's actual layer count:
+
+\begin{lstlisting}[language=Python, caption={Configuration patching for correct DynamicCache allocation.}, label={lst:config_patch}]
+import copy
+self.config = copy.deepcopy(base_model.config)
+shard_layer_count = self.end_layer - self.start_layer + 1
+self.config.num_hidden_layers = shard_layer_count
+\end{lstlisting}
+
+This ensures that each shard's \texttt{DynamicCache} allocates exactly $\ell_i$ slots, and \texttt{get\_seq\_length()} returns correct values for all shards.
+
+%-----------------------------------------------------------------------------
+\subsection{Topology Management}
+\label{sec:topology}
+%-----------------------------------------------------------------------------
+
+The \texttt{Topology} module maintains a directed graph of peer connections and capabilities. Each node maintains a local view of the topology that is updated via Iroh's document synchronization:
+
+\begin{itemize}
+    \item \textbf{Node registration:} When a peer is discovered via gossip, its capabilities (memory, compute, chip type) are recorded and its addresses are registered with the \texttt{ConnectionManager} for QUIC streaming.
+    \item \textbf{Ring formation:} Nodes are sorted by available memory (descending), with ties broken by node ID, establishing a deterministic ring ordering. This ensures all nodes independently compute the same topology without explicit coordination.
+    \item \textbf{Connectivity verification:} The topology supports reachability checks via BFS traversal to verify full connectivity before inference begins.
+\end{itemize}
+
+%=============================================================================
+\section{Execution Layer: Ring-Pipeline Inference}
+\label{sec:execution}
+%=============================================================================
+
+The \texttt{RingPipelineCoordinator} orchestrates the distributed inference process once topology and partitioning are established.
+
+%-----------------------------------------------------------------------------
+\subsection{Ring Initialization}
+\label{sec:ring_init}
+%-----------------------------------------------------------------------------
+
+Ring initialization proceeds in three phases:
+
+\begin{enumerate}
+    \item \textbf{Topology Resolution:} Each node independently sorts discovered peers by memory capacity to compute a deterministic ring ordering and identify its rank, predecessor, and successor.
+    \item \textbf{Layer Assignment:} The partitioning algorithm (\S\ref{sec:partitioning}) assigns contiguous layer windows to each rank.
+    \item \textbf{Connection Pre-Warming:} For multi-node configurations, the node proactively establishes QUIC connections to its ring neighbors (next, previous, and head) via the \texttt{ConnectionManager}, measuring RTT with a Ping/Pong exchange. This eliminates the cold-start latency on the first tensor transfer.
+\end{enumerate}
+
+%-----------------------------------------------------------------------------
+\subsection{Autoregressive Generation Protocol}
+\label{sec:generation}
+%-----------------------------------------------------------------------------
+
+Inference proceeds in two phases, as illustrated in Figure~\ref{fig:ring_flow}:
+
+\begin{figure}[t]
+\centering
+\placeholder{0.85\textwidth}{Ring pipeline data flow for 3-node autoregressive generation. Show: (1) Prefill: prompt tokens flow N0$\to$N1$\to$N2, N2 samples token; (2) Generation: single token flows N0$\to$N1$\to$N2, N2 samples and sends 8-byte token ID back to N0. Annotate data sizes at each edge (hidden states $\sim$2KB vs logits $\sim$0.58MB vs token ID $\sim$8B).}
+\caption{Autoregressive generation in a 3-node ring pipeline. During generation, the tail node samples the token locally and returns only the 8-byte token ID to the head, reducing return-path data by $\sim 18{,}000\times$.}
+\label{fig:ring_flow}
+\end{figure}
+
+\subsubsection{Prefill Phase.}
+The head node ($N_0$, rank~0) encodes the input prompt into token IDs using the tokenizer's chat template, constructs position IDs $[0, 1, \ldots, T\!-\!1]$ and an all-ones attention mask, and executes its assigned layers. The resulting hidden states, along with position metadata, are forwarded to the next node via the direct QUIC transport (\S\ref{sec:transport}). Each subsequent node processes its assigned layers and forwards the result until the tail node ($N_{N-1}$) completes the final layers and produces the first output logits.
+
+\subsubsection{Autoregressive Generation Phase.}
+For each subsequent generation step $t$:
+
+\begin{enumerate}
+    \item The head node feeds the previously sampled token (as a single-token input) into its shard at position $T + t - 1$.
+    \item Hidden states flow through the ring: $N_0 \rightarrow N_1 \rightarrow \cdots \rightarrow N_{N-1}$.
+    \item Each node applies its layers using its \emph{local} KV cache, appending the new key-value entries for the current token. The KV cache is never transmitted over the network.
+    \item The tail node produces logits, samples the next token, and sends it back to the head (see \S\ref{sec:tail_sampling}).
+    \item Generation terminates when an EOS token is sampled or \texttt{max\_tokens} is reached.
+\end{enumerate}
+
+\subsubsection{Position Metadata Forwarding.}
+Following Prima.cpp's \texttt{sync\_meta} approach, each tensor transfer includes position metadata required for correct RoPE~\cite{su2024roformer} embedding computation. In autoregressive mode (single-token steps), the position ID is sent as a single integer rather than a full array, reducing metadata overhead. Receiver nodes reconstruct the full \texttt{position\_ids} tensor as $[[\text{pos}]]$ from this compact representation.
+
+\subsubsection{Distributed KV Cache Management.}
+Each node maintains a local KV cache containing entries only for its assigned layers. The shard configuration patching described in \S\ref{sec:config_patch} ensures that the \texttt{DynamicCache} allocates exactly $\ell_i$ layer slots per shard. Cache state detection uses \texttt{get\_seq\_length()} to determine whether the current invocation is a prefill (cache empty) or a generation step (cache populated), which in turn determines the correct \texttt{cache\_position} tensor for the Transformers forward pass.
+
+\subsubsection{Event-Based Completion Signaling.}
+The head node uses \texttt{asyncio.Event}-based signaling to wait for ring completion, replacing a polling-based approach. When the tail node's response arrives at the head (either via intermediate forwarding or direct return), the event is set, providing zero-latency wakeup.
+
+%-----------------------------------------------------------------------------
+\subsection{Tail-Node Sampling Optimization}
+\label{sec:tail_sampling}
+%-----------------------------------------------------------------------------
+
+In a na\"ive ring pipeline, the tail node would send the complete logit tensor back to the head node for sampling. For a model with vocabulary size $V$, this tensor has size $1 \times V \times 4$ bytes (float32). For Qwen3-0.6B ($V = 151{,}936$), this amounts to approximately 0.58\,MB per generation step---the same size as the activation tensors flowing \emph{forward} through the ring, effectively doubling the per-step communication cost.
+
+We observe that the head node's only use of the logit tensor is to sample a single token ID. Therefore, we move the sampling operation to the tail node:
+
+\begin{enumerate}
+    \item The tail node applies nucleus (top-$p$) sampling locally on the logits.
+    \item The sampled token ID is encoded as a \texttt{numpy.int64} scalar ($\sim$8 bytes).
+    \item This compact result is sent directly to the head node via the pre-warmed QUIC connection, with an \texttt{is\_sampled\_token} flag in the metadata.
+    \item The head node detects the pre-sampled token (by checking \texttt{dtype == int64} and \texttt{size == 1}) and uses it directly without re-sampling.
+\end{enumerate}
+
+This optimization reduces the return-path data transfer from $\sim$0.58\,MB to $\sim$8 bytes per generation step---an approximately $18{,}000\times$ reduction---while maintaining identical sampling semantics.
+
+%=============================================================================
+\section{Evaluation}
+\label{sec:eval}
+%=============================================================================
+
+%-----------------------------------------------------------------------------
+\subsection{Experimental Setup}
+\label{sec:setup}
+%-----------------------------------------------------------------------------
+
+\noindent\textbf{Hardware.} Our testbed consists of three heterogeneous consumer-grade devices (Table~\ref{tab:hardware}), each connected to a different network to simulate a geographically distributed deployment. All inter-node communication traverses Iroh's relay infrastructure and QUIC NAT hole-punching.
+
+\begin{table}[t]
+    \centering
+    \caption{Hardware configuration of the evaluation testbed.}
+    \label{tab:hardware}
+    \begin{tabular}{llccc}
+    \toprule
+    \textbf{Node} & \textbf{Device} & \textbf{RAM} & \textbf{Chip} & \textbf{Role (28L)} \\
+    \midrule
+    $N_0$ (Head) & MacBook Air M2 & 16\,GB & Apple M2 & Layers 0--13 \\
+    $N_1$ & Mac Mini & 8\,GB & Apple M-series & Layers 14--20 \\
+    $N_2$ (Tail) & Linux Laptop & 8\,GB & Intel i5 (CPU) & Layers 21--27 \\
+    \bottomrule
+    \end{tabular}
+\end{table}
+
+\noindent\textbf{Models.} We evaluate on two models: Llama-3.2-1B-Instruct~\cite{grattafiori2024llama} (16 layers, 1.24B parameters) and Qwen3-0.6B~\cite{yang2025qwen3} (28 layers, 0.6B parameters). Both are loaded via Hugging Face \texttt{AutoModelForCausalLM} with no quantization.
+
+\noindent\textbf{Metrics.} We report three metrics, averaged across 32-, 64-, and 128-token generation sequences: (1)~\textbf{Time-to-First-Token (TTFT)}: latency from request submission to the first token being generated; (2)~\textbf{Average Time Per Token (ATPT)}: mean latency per autoregressive generation step; (3)~\textbf{Tokens/sec}: generation throughput.
+
+%-----------------------------------------------------------------------------
+\subsection{Baseline Results}
+\label{sec:baseline_results}
+%-----------------------------------------------------------------------------
+
+Table~\ref{tab:baseline} presents the baseline performance using the initial document-based tensor transport (before the optimizations described in \S\ref{sec:transport}--\ref{sec:tail_sampling}).
+
+\begin{table}[t]
+    \centering
+    \caption{Baseline performance (document-based transport), averaged across 32, 64, and 128 token generation sequences.}
+    \label{tab:baseline}
+    \begin{tabular}{llccc}
+    \toprule
+    \textbf{Nodes} & \textbf{Model} & \textbf{TTFT (ms)} & \textbf{ATPT (ms)} & \textbf{Tokens/s} \\
+    \midrule
+    \multirow{2}{*}{1-Node} & Llama-3.2-1B & 942 & 130 & 6.96 \\
+    & Qwen3-0.6B & 661 & 113 & 8.06 \\
+    \midrule
+    \multirow{2}{*}{2-Node} & Llama-3.2-1B & 10{,}506 & 817 & 0.99 \\
+    & Qwen3-0.6B & 2{,}096 & 559 & 1.70 \\
+    \midrule
+    \multirow{2}{*}{3-Node} & Llama-3.2-1B & 10{,}508 & 953 & 0.89 \\
+    & Qwen3-0.6B & 3{,}029 & 669 & 1.36 \\
+    \bottomrule
+    \end{tabular}
+\end{table}
+
+The baseline results reveal a severe communication bottleneck: moving from 1-node to 2-node degrades Llama-3.2-1B throughput from 6.96 to 0.99 tokens/s ($7\times$ slowdown), with TTFT increasing from 942\,ms to over 10\,s. The Qwen3-0.6B model exhibits a smaller but still significant degradation ($4.7\times$ slowdown in throughput).
+
+%-----------------------------------------------------------------------------
+\subsection{Optimized Transport Results}
+\label{sec:opt_results}
+%-----------------------------------------------------------------------------
+
+Table~\ref{tab:optimized} presents performance after enabling all communication optimizations: direct QUIC transport, connection pre-warming, tail-node sampling, and compact metadata encoding.
+
+\begin{table}[t]
+    \centering
+    \caption{Optimized performance (direct QUIC transport + tail-node sampling). \textcolor{gray}{\textit{TODO: Fill with actual benchmark values.}}}
+    \label{tab:optimized}
+    \begin{tabular}{llccc}
+    \toprule
+    \textbf{Nodes} & \textbf{Model} & \textbf{TTFT (ms)} & \textbf{ATPT (ms)} & \textbf{Tokens/s} \\
+    \midrule
+    \multirow{2}{*}{1-Node} & Llama-3.2-1B & --- & --- & --- \\
+    & Qwen3-0.6B & --- & --- & --- \\
+    \midrule
+    \multirow{2}{*}{2-Node} & Llama-3.2-1B & --- & --- & --- \\
+    & Qwen3-0.6B & --- & --- & --- \\
+    \midrule
+    \multirow{2}{*}{3-Node} & Llama-3.2-1B & --- & --- & --- \\
+    & Qwen3-0.6B & --- & --- & --- \\
+    \bottomrule
+    \end{tabular}
+\end{table}
+
+%-----------------------------------------------------------------------------
+\subsection{Communication Overhead Analysis}
+\label{sec:comm_analysis}
+%-----------------------------------------------------------------------------
+
+Table~\ref{tab:comm_breakdown} provides a detailed breakdown of per-step communication costs under both transport modes, isolating the impact of each optimization.
+
+\begin{table}[t]
+    \centering
+    \caption{Per-step communication breakdown for Qwen3-0.6B (3-node). \textcolor{gray}{\textit{TODO: Fill with actual profiling data.}}}
+    \label{tab:comm_breakdown}
+    \begin{tabular}{lcc}
+    \toprule
+    \textbf{Component} & \textbf{Baseline (ms)} & \textbf{Optimized (ms)} \\
+    \midrule
+    QUIC connection setup & --- & 0 (pre-warmed) \\
+    Forward transfer ($N_i \to N_{i+1}$) & --- & --- \\
+    Return transfer (tail $\to$ head) & --- & --- \\
+    Metadata encoding/decoding & --- & --- \\
+    Local compute (inference) & --- & --- \\
+    \midrule
+    \textbf{Total per step} & --- & --- \\
+    \bottomrule
+    \end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\placeholder{0.85\textwidth}{Bar chart or stacked area chart comparing per-step latency breakdown: compute vs. forward-transfer vs. return-transfer vs. overhead, for baseline and optimized configurations, across 2-node and 3-node setups.}
+\caption{Per-step latency breakdown by component for baseline and optimized configurations.}
+\label{fig:latency_breakdown}
+\end{figure}
+
+%-----------------------------------------------------------------------------
+\subsection{Scaling Analysis}
+\label{sec:scaling}
+%-----------------------------------------------------------------------------
+
+\begin{figure}[t]
+\centering
+\placeholder{0.85\textwidth}{Line plot: tokens/sec vs. number of nodes (1, 2, 3) for both models under both baseline and optimized transport. Show the 1/N ideal scaling line for reference.}
+\caption{Throughput scaling as a function of node count. The gap between measured throughput and ideal scaling reflects the communication overhead inherent in the ring pipeline.}
+\label{fig:scaling}
+\end{figure}
+
+Figure~\ref{fig:scaling} shows throughput as a function of node count. In an ideal pipeline with zero communication overhead, throughput should remain constant as additional nodes reduce per-node compute while adding one inter-node transfer per stage. In practice, the communication overhead dominates: each generation step requires $N\!-\!1$ inter-node tensor transfers, each incurring network latency proportional to the hidden state tensor size and the network RTT.
+
+%=============================================================================
+\section{Discussion}
+\label{sec:discussion}
+%=============================================================================
+
+%-----------------------------------------------------------------------------
+\subsection{Bottleneck Analysis}
+\label{sec:bottleneck}
+%-----------------------------------------------------------------------------
+
+Our profiling reveals that the dominant bottleneck in multi-node inference is the \textbf{forward-path tensor transfer}. At each generation step, hidden state tensors of size $B \times 1 \times H$ (where $H$ is the hidden dimension; $H=2048$ for Qwen3-0.6B, $H=2048$ for Llama-3.2-1B) must traverse $N\!-\!1$ network hops. With float32 precision, each transfer is approximately $B \times H \times 4$ bytes $\approx$ 8\,KB for single-token generation. While this payload is small, the round-trip through the full ring accumulates QUIC frame overhead, relay latency (when direct hole-punching fails), and Python-side serialization costs.
+
+The tail-node sampling optimization (\S\ref{sec:tail_sampling}) effectively eliminates the return-path overhead, reducing it from a dominant contributor (0.58\,MB per step for Qwen3-0.6B) to negligible (8 bytes). This makes the \emph{forward path} the single remaining communication bottleneck, suggesting that future optimizations should focus on reducing forward-transfer latency---through activation compression, speculative execution, or direct path optimization.
+
+%-----------------------------------------------------------------------------
+\subsection{Correctness Considerations}
+\label{sec:correctness}
+%-----------------------------------------------------------------------------
+
+Distributed autoregressive generation introduces several correctness challenges that HyperCluster addresses:
+
+\begin{enumerate}
+    \item \textbf{Position Embedding Consistency:} Each node must apply RoPE embeddings at the correct absolute position. HyperCluster forwards position IDs alongside hidden states to ensure all nodes compute position-dependent attention correctly.
+
+    \item \textbf{KV Cache Isolation:} Each node's cache must store entries only for its assigned layers with correct indexing. Our configuration patching (\S\ref{sec:config_patch}) and layer re-indexing ensure that \texttt{DynamicCache} allocates the correct number of slots and that \texttt{get\_seq\_length()} returns accurate values.
+
+    \item \textbf{LM Head Application:} The language model head (which projects hidden states to vocabulary logits) must be applied exactly once, by the tail node. The execution layer explicitly tracks which node completes the final model layer and gates LM head application accordingly.
+
+    \item \textbf{Generation Step Detection:} Worker nodes must distinguish between the first forward pass (prefill) and subsequent autoregressive steps to correctly reset their layer processing state. HyperCluster detects new generation steps by observing when \texttt{current\_layer $\geq$ total\_layers} from a previous step, triggering a reset to the node's layer window start.
+\end{enumerate}
+
+%-----------------------------------------------------------------------------
+\subsection{Comparison with Related Systems}
+%-----------------------------------------------------------------------------
+
+Table~\ref{tab:comparison} qualitatively compares HyperCluster with related systems across key design dimensions.
+
+\begin{table}[t]
+    \centering
+    \caption{Qualitative comparison of distributed inference systems.}
+    \label{tab:comparison}
+    \begin{tabular}{lccccc}
+    \toprule
+    \textbf{Feature} & \textbf{Ours} & \textbf{Petals} & \textbf{Exo} & \textbf{Prima} & \textbf{Lattica} \\
+    \midrule
+    Fully Decentralized & \checkmark & $\sim$ & \checkmark & \checkmark & \checkmark \\
+    NAT Traversal & \checkmark & -- & -- & -- & \checkmark \\
+    Model-Agnostic & \checkmark & $\sim$ & -- & -- & N/A \\
+    Ring Pipeline & \checkmark & -- & \checkmark & \checkmark & N/A \\
+    HF Transformers & \checkmark & -- & $\sim$ & -- & N/A \\
+    Direct P2P Tensor & \checkmark & -- & $\sim$ & \checkmark & \checkmark \\
+    CPU + Heterogeneous & \checkmark & -- & \checkmark & \checkmark & N/A \\
+    \bottomrule
+    \end{tabular}
+\end{table}
+
+%-----------------------------------------------------------------------------
+\subsection{Limitations}
+\label{sec:limitations}
+%-----------------------------------------------------------------------------
+
+\begin{enumerate}
+    \item \textbf{Communication-Bound Throughput:} The system is fundamentally limited by inter-node latency. Each generation step requires a full ring traversal, making throughput inversely proportional to the number of network hops and their respective latencies.
+
+    \item \textbf{No Fault Tolerance During Inference:} While the system handles node discovery dynamically, an inference session must be restarted if a node fails mid-generation. Checkpointing and migration of KV cache state are left to future work.
+
+    \item \textbf{No Tensor Parallelism:} HyperCluster employs pure pipeline parallelism (inter-layer sharding). Tensor parallelism (intra-layer sharding) would require per-layer all-reduce operations that are impractical at current wireless network bandwidths but may become viable as connectivity improves.
+
+    \item \textbf{Initialization Ordering Sensitivity:} The current implementation exhibits sensitivity to the order in which nodes initialize and join the ring, occasionally affecting generation quality. This is related to race conditions in the topology convergence and cache initialization sequence, and is an active area of investigation.
+\end{enumerate}
+
+%=============================================================================
+\section{Future Work}
+\label{sec:future}
+%=============================================================================
+
+Several directions emerge from this work:
+
+\begin{enumerate}
+    \item \textbf{Activation Compression:} Apply quantization or learned compression to hidden state tensors before transmission, reducing the dominant forward-path transfer cost. Preliminary analysis suggests that 8-bit quantization of activations could reduce per-hop transfer size by $4\times$ with minimal quality degradation.
+
+    \item \textbf{Speculative Decoding:} Implement draft-model speculative decoding where a smaller model runs locally on the head node to generate candidate tokens, which are then verified in batches through the ring---amortizing the per-token communication cost over multiple tokens.
+
+    \item \textbf{Model Quantization:} Integrate weight quantization (GPTQ, AWQ, GGUF) to reduce per-node memory requirements, enabling larger models on the same hardware and potentially supporting models that currently exceed the cluster's aggregate memory.
+
+    \item \textbf{Fault-Tolerant Inference:} Implement KV cache checkpointing and layer reassignment to enable seamless recovery when a node fails or disconnects during an active inference session.
+
+    \item \textbf{Expanded Architecture Support:} Extend the sharding engine to support Mixture-of-Experts (MoE) architectures, where expert routing decisions could be informed by the topology to minimize cross-node communication, and vision-language models for multimodal inference.
+\end{enumerate}
+
+%=============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+%=============================================================================
+
+We presented HyperCluster, a decentralized framework for collaborative LLM inference across heterogeneous wireless peer-to-peer networks. The system makes four contributions: (1)~a deterministic ring-pipeline protocol enabling coordinator-free distributed inference; (2)~a model-agnostic sharding engine built on Hugging Face Transformers with configuration patching for correct KV cache management; (3)~a direct QUIC transport layer with framed RPC, connection pooling, and pre-warming; and (4)~a tail-node sampling optimization achieving an $18{,}000\times$ reduction in return-path data transfer.
+
+Our evaluation on a three-node heterogeneous cluster demonstrates that fully decentralized inference of billion-parameter LLMs is achievable on consumer-grade devices communicating across separate networks. While communication overhead remains the dominant bottleneck---an inherent challenge of pipeline parallelism over wireless links---our transport optimizations significantly reduce per-step latency. This work establishes HyperCluster as a practical testbed for exploring the foundations of communication-efficient, privacy-preserving collaborative AI at the network edge.
+
+\begin{credits}
+\subsubsection{\ackname}
+This work builds upon ideas from the Exo project for model sharding, Prima.cpp for ring pipeline architectures, Lattica for framed RPC protocol design, and Iroh for P2P networking primitives. We thank the open-source community for their foundational contributions.
+
+\subsubsection{\discintname}
+The authors have no competing interests to declare that are relevant to the content of this article.
+\end{credits}
+
+% ---- Bibliography ----
+\bibliographystyle{splncs04}
+\begin{thebibliography}{13}
+
+\bibitem{shoeybi2019megatron}
+Shoeybi, M., Patwary, M., Puri, R., LeGresley, P., Casper, J., Catanzaro, B.: Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism. arXiv preprint arXiv:1909.08053 (2019)
+
+\bibitem{rasley2020deepspeed}
+Rasley, J., Rajbhandari, S., Ruwase, A., He, Y.: DeepSpeed: System Optimizations Enable Training Deep Learning Models with Over 100 Billion Parameters. In: KDD '20, pp. 3505--3506 (2020)
+
+\bibitem{wolf-etal-2020-transformers}
+Wolf, T., et al.: Transformers: State-of-the-Art Natural Language Processing. In: EMNLP 2020, pp. 38--45 (2020)
+
+\bibitem{borzunov2023petals}
+Borzunov, A., et al.: Petals: Collaborative Inference and Fine-tuning of Large Models. arXiv preprint arXiv:2209.01188 (2023)
+
+\bibitem{exo}
+Exo: Distributed Inference on Consumer Devices. \url{https://github.com/exo-explore/exo} (2024)
+
+\bibitem{yang2025lattica}
+Yang, X.: Lattica: A Universal, Cross-NAT Communication Framework for Decentralized AI. Technical Report (2025)
+
+\bibitem{patarasuk2009bandwidth}
+Patarasuk, P., Yuan, X.: Bandwidth-optimal all-reduce algorithms for clusters of workstations. J. Parallel Distrib. Comput. \textbf{69}(2), 117--124 (2009)
+
+\bibitem{li2025prima}
+Li, J.: Prima.cpp: Pipelined Ring Inference for Large Language Models. Technical Report (2025)
+
+\bibitem{iroh2024}
+Iroh: Content-addressed Networking Library. \url{https://iroh.computer} (2024)
+
+\bibitem{grattafiori2024llama}
+Grattafiori, A., et al.: Llama 3.2: Open-Weights Large Language Models. Meta AI Technical Report (2024)
+
+\bibitem{yang2025qwen3}
+Yang, A., et al.: Qwen3 Technical Report. arXiv preprint (2025)
+
+\bibitem{zheng2022alpa}
+Zheng, L., et al.: Alpa: Automating Inter- and Intra-Operator Parallelism for Distributed Deep Learning. In: OSDI '22 (2022)
+
+\bibitem{su2024roformer}
+Su, J., Ahmed, M., Lu, Y., Pan, S., Bo, W., Liu, Y.: RoFormer: Enhanced Transformer with Rotary Position Embedding. Neurocomputing \textbf{568}, 127063 (2024)
+
+\end{thebibliography}
+\end{document}

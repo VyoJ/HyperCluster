@@ -1,0 +1,72 @@
+{
+  "request_id": "a4e292b7-80e2-4e54-9643-b880e5c28c0d",
+  "timestamp": "2026-02-16T22:16:22.721199",
+  "query_id": "a4e292b7-80e2-4e54-9643-b880e5c28c0d",
+  "prompt": "hi",
+  "response": "How can I assist you today?",
+  "full_text": "hiHow can I assist you today?",
+  "tokens": {
+    "prompt_tokens": 36,
+    "generated_tokens": 8,
+    "total_tokens": 44,
+    "tokens_per_second": 1.1621692558548102,
+    "time_to_first_token_ms": 4853.299856185913,
+    "avg_time_per_token_ms": 278.20961815970287,
+    "token_ids": [
+      4438,
+      649,
+      358,
+      7945,
+      499,
+      3432,
+      30,
+      128009
+    ]
+  },
+  "timing": {
+    "total_time_s": 6.883678913116455,
+    "encoding_time_ms": 29.237031936645508,
+    "inference_time_ms": 6814.378976821899,
+    "decoding_time_ms": null,
+    "sampling_time_ms": null,
+    "network_wait_time_ms": 0.0,
+    "step_times_ms": [
+      4822.797775268555,
+      830.0142288208008,
+      201.61986351013184,
+      181.51593208312988,
+      205.5990695953369,
+      178.72309684753418,
+      175.0161647796631,
+      174.97897148132324
+    ]
+  },
+  "model": {
+    "model_name": "meta-llama/Llama-3.2-1B-Instruct",
+    "total_layers": 16,
+    "layers_on_node": 16,
+    "inference_mode": "ring",
+    "dtype": null,
+    "device": "cpu",
+    "memory_used_mb": null,
+    "peak_memory_mb": null
+  },
+  "network": {
+    "num_nodes": 1,
+    "node_rank": 0,
+    "world_size": 1,
+    "avg_latency_ms": null,
+    "min_latency_ms": null,
+    "max_latency_ms": null,
+    "total_data_sent_bytes": 0,
+    "total_data_received_bytes": 0,
+    "ring_cycles": null,
+    "layer_window_start": 0,
+    "layer_window_end": 15
+  },
+  "temperature": 0.7,
+  "top_p": 0.9,
+  "max_tokens": 50,
+  "error": null,
+  "success": true
+}

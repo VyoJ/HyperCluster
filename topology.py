@@ -40,10 +40,23 @@ class Topology:
         self.nodes: Dict[str, DeviceCapabilities] = {}
         self.peer_graph: Dict[str, Set[PeerConnection]] = {}
         self.active_node_id: Optional[str] = None
+        self.compute_offers: Dict[str, bool] = {}  # node_id -> offers_compute
 
     def update_node(self, node_id: str, device_capabilities: DeviceCapabilities):
         """Update or add a node's capabilities."""
         self.nodes[node_id] = device_capabilities
+
+    def set_compute_offering(self, node_id: str, offers: bool):
+        """Set whether a node offers its compute for LLM layer loading."""
+        self.compute_offers[node_id] = offers
+
+    def get_compute_nodes(self) -> List[Tuple[str, DeviceCapabilities]]:
+        """Get all nodes that have offered their compute for LLM inference."""
+        return [
+            (node_id, cap)
+            for node_id, cap in self.nodes.items()
+            if self.compute_offers.get(node_id, False)
+        ]
 
     def get_node(self, node_id: str) -> Optional[DeviceCapabilities]:
         """Get a node's capabilities."""
@@ -64,6 +77,8 @@ class Topology:
         """Remove a node from the topology."""
         if node_id in self.nodes:
             del self.nodes[node_id]
+        if node_id in self.compute_offers:
+            del self.compute_offers[node_id]
         if node_id in self.peer_graph:
             del self.peer_graph[node_id]
         # Remove edges pointing to this node
@@ -141,6 +156,7 @@ class Topology:
                 for node_id, connections in self.peer_graph.items()
             },
             "active_node_id": self.active_node_id,
+            "compute_offers": self.compute_offers,
         }
 
     @staticmethod
@@ -163,5 +179,8 @@ class Topology:
 
         # Restore active node
         topology.active_node_id = data.get("active_node_id")
+
+        # Restore compute offers
+        topology.compute_offers = data.get("compute_offers", {})
 
         return topology

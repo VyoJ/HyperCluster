@@ -1,0 +1,136 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\citation{shoeybi2019megatron}
+\citation{rasley2020deepspeed}
+\@writefile{toc}{\contentsline {title}{HyperCluster: Decentralized Large Language Model Inference over Peer-to-Peer Wireless Networks}{1}{chapter.1}\protected@file@percent }
+\@writefile{toc}{\authcount {1}}
+\@writefile{toc}{\contentsline {author}{Anonymous Submission}{1}{chapter.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{section.1}\protected@file@percent }
+\newlabel{sec:intro}{{1}{1}{Introduction}{section.1}{}}
+\citation{borzunov2023petals}
+\citation{exo}
+\citation{li2025prima}
+\citation{iroh2024}
+\citation{wolf-etal-2020-transformers}
+\citation{grattafiori2024llama}
+\citation{yang2025qwen3}
+\citation{shoeybi2019megatron}
+\citation{rasley2020deepspeed}
+\citation{zheng2022alpa}
+\citation{borzunov2023petals}
+\citation{exo}
+\citation{yang2025lattica}
+\@writefile{toc}{\contentsline {section}{\numberline {2}Background and Related Work}{3}{section.2}\protected@file@percent }
+\newlabel{sec:related}{{2}{3}{Background and Related Work}{section.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Model Parallelism in Centralized Environments}{3}{subsection.2.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}Decentralized and Peer-to-Peer Inference}{3}{subsection.2.2}\protected@file@percent }
+\citation{patarasuk2009bandwidth}
+\citation{li2025prima}
+\citation{iroh2024}
+\citation{iroh2024}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces HyperCluster system architecture. The four-layer stack enables decentralized ring-pipeline inference over P2P wireless networks.}}{4}{figure.caption.2}\protected@file@percent }
+\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
+\newlabel{fig:architecture}{{1}{4}{HyperCluster system architecture. The four-layer stack enables decentralized ring-pipeline inference over P2P wireless networks}{figure.caption.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.3}Ring Topologies for Distributed Computation}{4}{subsection.2.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}System Architecture}{4}{section.3}\protected@file@percent }
+\newlabel{sec:system_design}{{3}{4}{System Architecture}{section.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Network Layer: P2P Communication via Iroh}{4}{subsection.3.1}\protected@file@percent }
+\newlabel{sec:network}{{3.1}{4}{Network Layer: P2P Communication via Iroh}{subsection.3.1}{}}
+\citation{yang2025lattica}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Transport Layer: Direct QUIC Streams}{5}{subsection.3.2}\protected@file@percent }
+\newlabel{sec:transport}{{3.2}{5}{Transport Layer: Direct QUIC Streams}{subsection.3.2}{}}
+\newlabel{eq:frame}{{1}{5}{Transport Layer: Direct QUIC Streams}{equation.1}{}}
+\newlabel{eq:tensor_wire}{{2}{6}{Transport Layer: Direct QUIC Streams}{equation.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Partitioning Layer: Memory-Weighted Sharding}{6}{subsection.3.3}\protected@file@percent }
+\newlabel{sec:partitioning}{{3.3}{6}{Partitioning Layer: Memory-Weighted Sharding}{subsection.3.3}{}}
+\@writefile{toc}{\contentsline {subsubsection}{Partitioning Algorithm.}{6}{section*.3}\protected@file@percent }
+\newlabel{eq:layer_alloc}{{3}{6}{Partitioning Algorithm}{equation.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.4}Sharding Engine: Dynamic Layer Extraction}{6}{subsection.3.4}\protected@file@percent }
+\newlabel{sec:sharding}{{3.4}{6}{Sharding Engine: Dynamic Layer Extraction}{subsection.3.4}{}}
+\@writefile{toc}{\contentsline {subsubsection}{Shard Roles.}{6}{section*.4}\protected@file@percent }
+\citation{su2024roformer}
+\@writefile{loa}{\contentsline {algorithm}{\numberline {1}{\ignorespaces Memory-Weighted Layer Partitioning}}{7}{algorithm.1}\protected@file@percent }
+\newlabel{alg:partitioning}{{1}{7}{Memory-Weighted Layer Partitioning}{algorithm.1}{}}
+\@writefile{toc}{\contentsline {subsubsection}{Layer Re-Indexing.}{7}{section*.5}\protected@file@percent }
+\newlabel{sec:config_patch}{{3.4}{7}{Configuration Patching for Correct Cache Allocation}{section*.6}{}}
+\@writefile{toc}{\contentsline {subsubsection}{Configuration Patching for Correct Cache Allocation.}{7}{section*.6}\protected@file@percent }
+\newlabel{lst:config_patch}{{1.1}{8}{Configuration patching for correct DynamicCache allocation}{lstlisting.1.1}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {1.1}{\ignorespaces Configuration patching for correct DynamicCache allocation.}}{8}{lstlisting.1.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.5}Topology Management}{8}{subsection.3.5}\protected@file@percent }
+\newlabel{sec:topology}{{3.5}{8}{Topology Management}{subsection.3.5}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {4}Execution Layer: Ring-Pipeline Inference}{8}{section.4}\protected@file@percent }
+\newlabel{sec:execution}{{4}{8}{Execution Layer: Ring-Pipeline Inference}{section.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Ring Initialization}{8}{subsection.4.1}\protected@file@percent }
+\newlabel{sec:ring_init}{{4.1}{8}{Ring Initialization}{subsection.4.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Autoregressive Generation Protocol}{8}{subsection.4.2}\protected@file@percent }
+\newlabel{sec:generation}{{4.2}{8}{Autoregressive Generation Protocol}{subsection.4.2}{}}
+\citation{su2024roformer}
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Autoregressive generation in a 3-node ring pipeline. During generation, the tail node samples the token locally and returns only the 8-byte token ID to the head, reducing return-path data by $\sim 18{,}000\times $.}}{9}{figure.caption.7}\protected@file@percent }
+\newlabel{fig:ring_flow}{{2}{9}{Autoregressive generation in a 3-node ring pipeline. During generation, the tail node samples the token locally and returns only the 8-byte token ID to the head, reducing return-path data by $\sim 18{,}000\times $}{figure.caption.7}{}}
+\@writefile{toc}{\contentsline {subsubsection}{Prefill Phase.}{9}{section*.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{Autoregressive Generation Phase.}{9}{section*.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{Position Metadata Forwarding.}{9}{section*.10}\protected@file@percent }
+\citation{grattafiori2024llama}
+\citation{yang2025qwen3}
+\@writefile{toc}{\contentsline {subsubsection}{Distributed KV Cache Management.}{10}{section*.11}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{Event-Based Completion Signaling.}{10}{section*.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Tail-Node Sampling Optimization}{10}{subsection.4.3}\protected@file@percent }
+\newlabel{sec:tail_sampling}{{4.3}{10}{Tail-Node Sampling Optimization}{subsection.4.3}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Evaluation}{10}{section.5}\protected@file@percent }
+\newlabel{sec:eval}{{5}{10}{Evaluation}{section.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Experimental Setup}{10}{subsection.5.1}\protected@file@percent }
+\newlabel{sec:setup}{{5.1}{10}{Experimental Setup}{subsection.5.1}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Hardware configuration of the evaluation testbed.}}{11}{table.caption.13}\protected@file@percent }
+\newlabel{tab:hardware}{{1}{11}{Hardware configuration of the evaluation testbed}{table.caption.13}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Baseline performance (document-based transport), averaged across 32, 64, and 128 token generation sequences.}}{11}{table.caption.14}\protected@file@percent }
+\newlabel{tab:baseline}{{2}{11}{Baseline performance (document-based transport), averaged across 32, 64, and 128 token generation sequences}{table.caption.14}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Baseline Results}{11}{subsection.5.2}\protected@file@percent }
+\newlabel{sec:baseline_results}{{5.2}{11}{Baseline Results}{subsection.5.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}Optimized Transport Results}{11}{subsection.5.3}\protected@file@percent }
+\newlabel{sec:opt_results}{{5.3}{11}{Optimized Transport Results}{subsection.5.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.4}Communication Overhead Analysis}{11}{subsection.5.4}\protected@file@percent }
+\newlabel{sec:comm_analysis}{{5.4}{11}{Communication Overhead Analysis}{subsection.5.4}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Optimized performance (direct QUIC transport + tail-node sampling). \textcolor {gray}{\textit  {TODO: Fill with actual benchmark values.}}}}{12}{table.caption.15}\protected@file@percent }
+\newlabel{tab:optimized}{{3}{12}{Optimized performance (direct QUIC transport + tail-node sampling). \textcolor {gray}{\textit {TODO: Fill with actual benchmark values.}}}{table.caption.15}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Per-step communication breakdown for Qwen3-0.6B (3-node). \textcolor {gray}{\textit  {TODO: Fill with actual profiling data.}}}}{12}{table.caption.16}\protected@file@percent }
+\newlabel{tab:comm_breakdown}{{4}{12}{Per-step communication breakdown for Qwen3-0.6B (3-node). \textcolor {gray}{\textit {TODO: Fill with actual profiling data.}}}{table.caption.16}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.5}Scaling Analysis}{12}{subsection.5.5}\protected@file@percent }
+\newlabel{sec:scaling}{{5.5}{12}{Scaling Analysis}{subsection.5.5}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {6}Discussion}{12}{section.6}\protected@file@percent }
+\newlabel{sec:discussion}{{6}{12}{Discussion}{section.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Bottleneck Analysis}{12}{subsection.6.1}\protected@file@percent }
+\newlabel{sec:bottleneck}{{6.1}{12}{Bottleneck Analysis}{subsection.6.1}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Per-step latency breakdown by component for baseline and optimized configurations.}}{13}{figure.caption.17}\protected@file@percent }
+\newlabel{fig:latency_breakdown}{{3}{13}{Per-step latency breakdown by component for baseline and optimized configurations}{figure.caption.17}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Throughput scaling as a function of node count. The gap between measured throughput and ideal scaling reflects the communication overhead inherent in the ring pipeline.}}{13}{figure.caption.18}\protected@file@percent }
+\newlabel{fig:scaling}{{4}{13}{Throughput scaling as a function of node count. The gap between measured throughput and ideal scaling reflects the communication overhead inherent in the ring pipeline}{figure.caption.18}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Correctness Considerations}{13}{subsection.6.2}\protected@file@percent }
+\newlabel{sec:correctness}{{6.2}{13}{Correctness Considerations}{subsection.6.2}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces Qualitative comparison of distributed inference systems.}}{14}{table.caption.19}\protected@file@percent }
+\newlabel{tab:comparison}{{5}{14}{Qualitative comparison of distributed inference systems}{table.caption.19}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.3}Comparison with Related Systems}{14}{subsection.6.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.4}Limitations}{14}{subsection.6.4}\protected@file@percent }
+\newlabel{sec:limitations}{{6.4}{14}{Limitations}{subsection.6.4}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {7}Future Work}{15}{section.7}\protected@file@percent }
+\newlabel{sec:future}{{7}{15}{Future Work}{section.7}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {8}Conclusion}{15}{section.8}\protected@file@percent }
+\newlabel{sec:conclusion}{{8}{15}{Conclusion}{section.8}{}}
+\bibstyle{splncs04}
+\bibcite{shoeybi2019megatron}{1}
+\bibcite{rasley2020deepspeed}{2}
+\bibcite{wolf-etal-2020-transformers}{3}
+\bibcite{borzunov2023petals}{4}
+\bibcite{exo}{5}
+\bibcite{yang2025lattica}{6}
+\bibcite{patarasuk2009bandwidth}{7}
+\bibcite{li2025prima}{8}
+\bibcite{iroh2024}{9}
+\bibcite{grattafiori2024llama}{10}
+\bibcite{yang2025qwen3}{11}
+\bibcite{zheng2022alpa}{12}
+\bibcite{su2024roformer}{13}
+\@writefile{toc}{\contentsline {subsubsection}{Acknowledgments.}{16}{section*.20}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{Disclosure of Interests.}{16}{section*.21}\protected@file@percent }
+\gdef \@abspage@last{16}
