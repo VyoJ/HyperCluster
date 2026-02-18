@@ -331,9 +331,12 @@ def load_shard_direct(
     _prune_model_structure(model, shard, config)
 
     # 7. Patch config for this shard (for DynamicCache compatibility)
+    # CRITICAL: Patch BOTH the standalone config AND the model's internal config
+    # The model uses model.config internally for attention mask generation
     shard_layer_count = shard.end_layer - shard.start_layer + 1
     original_layers = config.num_hidden_layers
     config.num_hidden_layers = shard_layer_count
+    model.config.num_hidden_layers = shard_layer_count
     logger.info(
         f"   Patched config: num_hidden_layers={shard_layer_count} (was {original_layers})"
     )

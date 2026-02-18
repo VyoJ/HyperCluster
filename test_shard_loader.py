@@ -150,10 +150,104 @@ def test_wrapper():
     print("WRAPPER TEST PASSED!")
 
 
+def test_forward_pass():
+    """Test that we can actually do a forward pass through a shard."""
+    print("\n" + "=" * 60)
+    print("TEST: Forward pass through first shard")
+    print("=" * 60)
+
+    from shard_loader import load_shard_direct
+    from sharded_model import TransformersShard
+
+    shard = Shard(
+        "meta-llama/Llama-3.2-1B-Instruct", start_layer=0, end_layer=7, n_layers=16
+    )
+
+    model, config = load_shard_direct(
+        model_id="meta-llama/Llama-3.2-1B-Instruct",
+        shard=shard,
+        cache_dir="./model_cache",
+        device="cpu",
+        dtype=torch.float32,  # Use float32 for CPU
+    )
+
+    # Create wrapper
+    wrapped = TransformersShard(model, shard, pre_pruned=True)
+
+    # Verify model.config is patched
+    print(f"model.config.num_hidden_layers: {model.config.num_hidden_layers}")
+    print(f"wrapped.config.num_hidden_layers: {wrapped.config.num_hidden_layers}")
+    assert model.config.num_hidden_layers == 8, (
+        "Model config should be patched to 8 layers"
+    )
+
+    # Create test input - process prefix first
+    batch_size = 1
+    prefix_len = 16
+    input_ids = torch.randint(0, config.vocab_size, (batch_size, prefix_len))
+
+    print(f"Prefix input shape: {input_ids.shape}")
+
+    # Initial forward pass (prefix)
+    with torch.no_grad():
+        cache_position = torch.arange(prefix_len, dtype=torch.long)
+        output = wrapped(
+            input_ids=input_ids,
+            use_cache=True,
+            return_dict=True,
+            cache_position=cache_position,
+        )
+
+    print(f"After prefix - Output type: {type(output)}")
+    pkv = output.past_key_values
+    print(f"After prefix - KV cache layers: {len(pkv.key_cache)}")
+    print(f"After prefix - KV cache seq_len: {pkv.get_seq_length()}")
+
+    # Now do incremental decoding (single token)
+    print("\nTesting incremental decoding...")
+    next_token = torch.randint(0, config.vocab_size, (batch_size, 1))
+    cache_position = torch.tensor([prefix_len], dtype=torch.long)
+
+    with torch.no_grad():
+        output2 = wrapped(
+            input_ids=next_token,
+            past_key_values=pkv,
+            use_cache=True,
+            return_dict=True,
+            cache_position=cache_position,
+        )
+
+    pkv2 = output2.past_key_values
+    print(f"After 1 token - KV cache seq_len: {pkv2.get_seq_length()}")
+
+    # One more token
+    cache_position = torch.tensor([prefix_len + 1], dtype=torch.long)
+    next_token = torch.randint(0, config.vocab_size, (batch_size, 1))
+
+    with torch.no_grad():
+        output3 = wrapped(
+            input_ids=next_token,
+            past_key_values=pkv2,
+            use_cache=True,
+            return_dict=True,
+            cache_position=cache_position,
+        )
+
+    pkv3 = output3.past_key_values
+    print(f"After 2 tokens - KV cache seq_len: {pkv3.get_seq_length()}")
+
+    assert pkv3.get_seq_length() == prefix_len + 2, (
+        f"Expected {prefix_len + 2} cached tokens"
+    )
+
+    print("FORWARD PASS TEST PASSED!")
+
+
 if __name__ == "__main__":
     test_first_shard()
     test_last_shard()
     test_wrapper()
+    test_forward_pass()
     print("\n" + "=" * 60)
     print("ALL TESTS PASSED!")
     print("=" * 60)
