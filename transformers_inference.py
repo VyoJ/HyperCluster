@@ -735,46 +735,32 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                 )
 
     async def _load_shard(self, model_id: str, shard: Shard):
-        """Load model shard and tokenizer."""
+        """Load model shard and tokenizer using direct partial loading."""
 
         def _load():
-            from transformers import AutoConfig, AutoModelForCausalLM
+            from shard_loader import load_shard_direct
 
             logger.info(f"🔧 Loading shard {shard} for model {model_id}")
-
-            # Load config first
-            config = AutoConfig.from_pretrained(
-                model_id, cache_dir=self.cache_dir, trust_remote_code=True
-            )
-
-            logger.info("📋 Model Config:")
-            logger.info(f"   Model type: {config.model_type}")
-            logger.info(f"   Hidden size: {config.hidden_size}")
-            logger.info(f"   Num layers: {config.num_hidden_layers}")
-            logger.info(f"   Vocab size: {config.vocab_size}")
+            logger.info("   Using DIRECT partial loading (memory-efficient)")
 
             # Get device and dtype configuration
-            device_map = self._create_device_map_for_shard(shard)
+            device = self._get_target_device()
             torch_dtype = self._get_torch_dtype()
 
-            # Load model with appropriate configuration
-            model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                config=config,
+            # Use direct partial loading - only loads weights needed for this shard
+            # This never allocates memory for unused layers
+            model, config = load_shard_direct(
+                model_id=model_id,
+                shard=shard,
                 cache_dir=self.cache_dir,
-                device_map=device_map,
-                torch_dtype=torch_dtype,
-                low_cpu_mem_usage=True,
-                trust_remote_code=True,
+                device=device,
+                dtype=torch_dtype,
             )
 
-            # Wrap model in shard wrapper
-            model = self._wrap_model_in_shard(model, shard)
+            # Wrap model in shard wrapper for forward pass handling
+            model = self._wrap_model_in_shard(model, shard, pre_pruned=True)
 
-            # Set to eval mode
-            model.eval()
-
-            logger.info(f"Successfully loaded shard {shard}")
+            logger.info(f"✅ Successfully loaded shard {shard}")
             return model, config
 
         self.model, self.config = await self._run_in_model_thread(_load)
@@ -798,17 +784,30 @@ class TransformersShardedInferenceEngine(InferenceEngine):
 
         self.tokenizer = await self._run_in_tokenizer_thread(_load_tokenizer)
 
-    def _wrap_model_in_shard(self, model, shard: Shard):
+    def _wrap_model_in_shard(self, model, shard: Shard, pre_pruned: bool = False):
         """
         Wrap model to only execute assigned layers.
 
         Uses the TransformersShard wrapper to extract and execute only
         the layers assigned to this shard.
+
+        Args:
+            model: The model to wrap
+            shard: Shard specification
+            pre_pruned: If True, the model has already been pruned to only
+                       contain the shard's layers (from direct partial loading)
         """
         from sharded_model import TransformersShard
 
-        logger.info(f"Wrapping model in shard: {shard}")
-        return TransformersShard(model, shard)
+        logger.info(f"Wrapping model in shard: {shard} (pre_pruned={pre_pruned})")
+        return TransformersShard(model, shard, pre_pruned=pre_pruned)
+
+    def _get_target_device(self) -> str:
+        """Get the target device string for model loading."""
+        if torch.cuda.is_available():
+            return "cuda"
+        else:
+            return "cpu"
 
     def _create_device_map_for_shard(self, shard: Shard) -> Union[str, Dict[str, Any]]:
         """Create device map for the specific shard."""

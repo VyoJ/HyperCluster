@@ -12,14 +12,15 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from shard import Shard
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+)
+
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     PreTrainedModel,
-)
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,33 +46,43 @@ class TransformersShard:
     """
     Sharded wrapper for transformers models.
 
-    This wrapper takes a full model and only executes the layers assigned to this shard.
+    This wrapper takes a model and only executes the layers assigned to this shard.
     It handles three types of shards:
     - First shard: Has embeddings + assigned layers
     - Middle shard: Has only assigned layers
     - Last shard: Has assigned layers + layer norm + LM head
 
-    The wrapper extracts references to the needed components from the base model
-    and implements a custom forward pass that only executes the assigned layers.
+    The wrapper can work with two types of models:
+    - Full models (pre_pruned=False): Extracts references to needed components
+    - Pre-pruned models (pre_pruned=True): Model already contains only shard layers
     """
 
-    def __init__(self, base_model: PreTrainedModel, shard: Shard):
+    def __init__(
+        self, base_model: PreTrainedModel, shard: Shard, pre_pruned: bool = False
+    ):
         """
         Initialize the sharded model wrapper.
 
         Args:
-            base_model: The full pre-trained model
+            base_model: The pre-trained model (full or pre-pruned)
             shard: Shard specification defining which layers to execute
+            pre_pruned: If True, the model has already been pruned to only
+                       contain the shard's layers (from direct partial loading)
         """
         self.base_model = base_model
         self.shard = shard
         self.config = base_model.config
+        self.pre_pruned = pre_pruned
 
         # Determine the model architecture type
         self.model_type = self.config.model_type.lower()
 
-        # Get total number of layers from config
-        self.total_layers = self._get_total_layers()
+        # Get total number of layers from shard spec (for pre-pruned) or config
+        if pre_pruned:
+            # For pre-pruned models, use shard.n_layers as total
+            self.total_layers = shard.n_layers
+        else:
+            self.total_layers = self._get_total_layers()
 
         # Get layer range for this shard
         self.start_layer, self.end_layer = get_layer_range_for_shard(
@@ -83,10 +94,9 @@ class TransformersShard:
 
         # CRITICAL FIX: Override num_hidden_layers in config to match this shard.
         # Without this, DynamicCache (and other transformers internals) pre-allocate
-        # 28 slots based on config.num_hidden_layers, even though we only have 10
-        # layers. This causes len(cache.key_cache) == 28 instead of 10, and
-        # get_seq_length(0) returns 0 for empty padding slots → broken cache_position.
+        # slots based on config.num_hidden_layers, causing cache issues.
         import copy
+
         self.config = copy.deepcopy(base_model.config)
         shard_layer_count = self.end_layer - self.start_layer + 1
         if hasattr(self.config, "num_hidden_layers"):
@@ -123,6 +133,9 @@ class TransformersShard:
 
         This handles different model architectures (Llama, Qwen, GPT, etc.)
         by accessing the appropriate attributes.
+
+        For pre-pruned models, the layers are already the shard's layers
+        and are used directly without extraction.
         """
         # Get the base model (unwrap from CausalLM wrapper)
         if hasattr(self.base_model, "model"):
@@ -147,26 +160,36 @@ class TransformersShard:
         else:
             raise ValueError(f"Cannot find layers in {type(inner_model)}")
 
-        # Extract only the layers we need
-        self.layers = nn.ModuleList(
-            [all_layers[i] for i in range(self.start_layer, self.end_layer + 1)]
-        )
+        if self.pre_pruned:
+            # Model already pruned - layers are already the shard's layers (0-indexed)
+            # No need to extract or re-index
+            self.layers = all_layers
+            logger.info(
+                f"  Using pre-pruned layers: {len(self.layers)} layers (pre-indexed)"
+            )
+        else:
+            # Extract only the layers we need from full model
+            self.layers = nn.ModuleList(
+                [all_layers[i] for i in range(self.start_layer, self.end_layer + 1)]
+            )
 
-        # CRITICAL FIX: Re-index layer_idx on attention modules so the KV cache
-        # uses 0-based indices within this shard.
-        # Without this, a shard with layers 14-27 would create cache entries at
-        # indices 14-27 (with empty padding at 0-13), causing:
-        #   1. Cache reports 28 layers instead of 14
-        #   2. get_seq_length(0) returns 0 (empty slot) → cache_position always starts at 0
-        #   3. Position encoding corruption → gibberish output
-        for new_idx, layer in enumerate(self.layers):
-            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "layer_idx"):
-                old_idx = layer.self_attn.layer_idx
-                layer.self_attn.layer_idx = new_idx
-                if new_idx == 0 or new_idx == len(self.layers) - 1:
-                    logger.info(
-                        f"  Re-indexed layer {old_idx} → cache index {new_idx}"
-                    )
+            # CRITICAL FIX: Re-index layer_idx on attention modules so the KV cache
+            # uses 0-based indices within this shard.
+            # Without this, a shard with layers 14-27 would create cache entries at
+            # indices 14-27 (with empty padding at 0-13), causing:
+            #   1. Cache reports 28 layers instead of 14
+            #   2. get_seq_length(0) returns 0 (empty slot) → cache_position always starts at 0
+            #   3. Position encoding corruption → gibberish output
+            for new_idx, layer in enumerate(self.layers):
+                if hasattr(layer, "self_attn") and hasattr(
+                    layer.self_attn, "layer_idx"
+                ):
+                    old_idx = layer.self_attn.layer_idx
+                    layer.self_attn.layer_idx = new_idx
+                    if new_idx == 0 or new_idx == len(self.layers) - 1:
+                        logger.info(
+                            f"  Re-indexed layer {old_idx} → cache index {new_idx}"
+                        )
 
         # Extract rotary embeddings if present (needed for Qwen2, Llama, etc.)
         if hasattr(inner_model, "rotary_emb"):
@@ -186,20 +209,27 @@ class TransformersShard:
                 # Some other models
                 self.embed_tokens = inner_model.word_embeddings
             else:
-                raise ValueError(f"Cannot find embeddings in {type(inner_model)}")
+                # For pre-pruned non-first shards, embed_tokens might be None
+                if self.pre_pruned:
+                    self.embed_tokens = None
+                else:
+                    raise ValueError(f"Cannot find embeddings in {type(inner_model)}")
         else:
             self.embed_tokens = None
 
         # Extract final components if this is the last shard
         if self.shard.is_last_layer():
             # Final layer norm
-            if hasattr(inner_model, "norm"):
+            if hasattr(inner_model, "norm") and inner_model.norm is not None:
                 # Llama, Mistral, Qwen2
                 self.norm = inner_model.norm
-            elif hasattr(inner_model, "ln_f"):
+            elif hasattr(inner_model, "ln_f") and inner_model.ln_f is not None:
                 # GPT-2
                 self.norm = inner_model.ln_f
-            elif hasattr(inner_model, "final_layernorm"):
+            elif (
+                hasattr(inner_model, "final_layernorm")
+                and inner_model.final_layernorm is not None
+            ):
                 # Some other models
                 self.norm = inner_model.final_layernorm
             else:
@@ -209,12 +239,22 @@ class TransformersShard:
                 self.norm = None
 
             # LM head (output projection to vocabulary)
-            if hasattr(self.base_model, "lm_head"):
+            if (
+                hasattr(self.base_model, "lm_head")
+                and self.base_model.lm_head is not None
+            ):
                 self.lm_head = self.base_model.lm_head
-            elif hasattr(self.base_model, "embed_out"):
+            elif (
+                hasattr(self.base_model, "embed_out")
+                and self.base_model.embed_out is not None
+            ):
                 self.lm_head = self.base_model.embed_out
             else:
-                raise ValueError(f"Cannot find lm_head in {type(self.base_model)}")
+                # For pre-pruned non-last shards, lm_head might be None
+                if self.pre_pruned:
+                    self.lm_head = None
+                else:
+                    raise ValueError(f"Cannot find lm_head in {type(self.base_model)}")
         else:
             self.norm = None
             self.lm_head = None
@@ -477,7 +517,9 @@ class TransformersShard:
             # Forward through this layer
             # Different models have different signatures, so we try to be flexible
             if layer_idx == 0:
-                logger.debug(f"   Layer {layer_idx} kwargs: {list(layer_kwargs.keys())}")
+                logger.debug(
+                    f"   Layer {layer_idx} kwargs: {list(layer_kwargs.keys())}"
+                )
                 logger.debug(
                     f"   🔍 CRITICAL: use_cache value being passed: {layer_kwargs['use_cache']}"
                 )
@@ -596,7 +638,9 @@ class TransformersShard:
         # This prevents intermediate nodes from applying LM head when forwarding tensors
         if apply_lm_head is not None:
             is_last = apply_lm_head
-            logger.debug(f"🔄 Ring mode: apply_lm_head explicitly set to {apply_lm_head}")
+            logger.debug(
+                f"🔄 Ring mode: apply_lm_head explicitly set to {apply_lm_head}"
+            )
         else:
             is_last = self.shard.is_last_layer()
 
@@ -722,33 +766,31 @@ def load_sharded_model(
     model_path: str,
     shard: Shard,
     cache_dir: Optional[str] = None,
-    device_map: Union[str, dict] = "auto",
+    device: str = "auto",
     torch_dtype: Optional[torch.dtype] = None,
+    use_direct_loading: bool = True,
     **kwargs,
 ) -> TransformersShard:
     """
     Load a model and wrap it in a shard.
 
-    This loads the full model (with appropriate device mapping) and then
-    wraps it to execute only the assigned layers.
+    By default, uses direct partial loading which only loads the weights
+    needed for this shard (memory-efficient). Set use_direct_loading=False
+    to fall back to loading the full model.
 
     Args:
         model_path: HuggingFace model ID or path
         shard: Shard specification
         cache_dir: Directory to cache downloaded models
-        device_map: Device mapping strategy
+        device: Target device ('auto', 'cuda', 'cpu')
         torch_dtype: Torch dtype for model weights
+        use_direct_loading: If True, use memory-efficient direct loading
         **kwargs: Additional arguments for model loading
 
     Returns:
         TransformersShard wrapper around the loaded model
     """
-    logger.debug(f"Loading model {model_path} for shard {shard}")
-
-    # Load config
-    config = AutoConfig.from_pretrained(
-        model_path, cache_dir=cache_dir, trust_remote_code=True
-    )
+    logger.info(f"Loading model {model_path} for shard {shard}")
 
     # Determine dtype if not specified
     if torch_dtype is None:
@@ -760,23 +802,44 @@ def load_sharded_model(
         else:
             torch_dtype = torch.float32
 
-    # Load the full model
-    base_model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        config=config,
-        cache_dir=cache_dir,
-        device_map=device_map,
-        torch_dtype=torch_dtype,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-        **kwargs,
-    )
+    # Determine device
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Wrap in shard
-    sharded_model = TransformersShard(base_model, shard)
+    if use_direct_loading:
+        # Use memory-efficient direct partial loading
+        from shard_loader import load_shard_direct
 
-    # Set to eval mode by default
-    sharded_model.eval()
+        model, config = load_shard_direct(
+            model_id=model_path,
+            shard=shard,
+            cache_dir=cache_dir,
+            device=device,
+            dtype=torch_dtype,
+        )
 
-    logger.debug(f"Successfully loaded and sharded model {model_path}")
+        # Wrap in shard (model is already pruned)
+        sharded_model = TransformersShard(model, shard, pre_pruned=True)
+    else:
+        # Legacy: Load full model and extract layers
+        config = AutoConfig.from_pretrained(
+            model_path, cache_dir=cache_dir, trust_remote_code=True
+        )
+
+        base_model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            cache_dir=cache_dir,
+            device_map=device if device != "cpu" else None,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+            **kwargs,
+        )
+
+        # Wrap in shard
+        sharded_model = TransformersShard(base_model, shard, pre_pruned=False)
+        sharded_model.eval()
+
+    logger.info(f"Successfully loaded and sharded model {model_path}")
     return sharded_model
