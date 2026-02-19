@@ -556,7 +556,7 @@ class TransformersShard:
 
                 causal_mask = create_causal_mask(
                     config=self.config,
-                    input_embeds=hidden_states,
+                    inputs_embeds=hidden_states,
                     attention_mask=causal_mask,  # Pass 2D mask or None
                     cache_position=mask_cache_position,
                     past_key_values=past_key_values if shared_cache_object else None,

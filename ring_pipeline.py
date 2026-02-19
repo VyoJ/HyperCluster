@@ -380,20 +380,16 @@ class RingPipelineCoordinator:
             logger.debug(f"   Request ID: {request_id}")
             if request_id in self.inference_engine.caches:
                 cache = self.inference_engine.caches[request_id]
-                if hasattr(cache, "key_cache"):
-                    logger.debug(f"   ✅ Cache exists: {len(cache.key_cache)} layers")
-                    try:
-                        if hasattr(cache, "get_seq_length"):
-                            seq_len = cache.get_seq_length(0)
-                            logger.debug(f"   Cache seq_len: {seq_len}")
-                        elif len(cache.key_cache) > 0 and cache.key_cache[0] is not None:
-                            logger.debug(f"   Cache seq_len: {cache.key_cache[0].shape[-2]}")
-                        else:
-                            logger.debug("   Cache seq_len: (empty)")
-                    except Exception as e:
-                        logger.debug(f"   Cache seq_len: ERROR ({e})")
-                else:
+                if hasattr(cache, "get_seq_length"):
+                    # Modern Cache object (DynamicCache in transformers 5.2.0+)
+                    from transformers_inference import _get_cache_seq_length
+                    num_layers = len(cache) if hasattr(cache, "__len__") else 0
+                    seq_len = _get_cache_seq_length(cache)
+                    logger.debug(f"   ✅ Cache exists ({type(cache).__name__}): {num_layers} layers, seq_len={seq_len}")
+                elif hasattr(cache, "__len__"):
                     logger.debug(f"   ✅ Cache exists (tuple): {len(cache)} layers")
+                else:
+                    logger.debug(f"   ✅ Cache exists: {type(cache).__name__}")
             else:
                 logger.debug("   ❌ No cache found")
             logger.debug("")
@@ -887,22 +883,18 @@ class RingPipelineCoordinator:
                 logger.debug("🔍 WORKER NODE CACHE CHECK")
                 if request_id in self.inference_engine.caches:
                     cache = self.inference_engine.caches[request_id]
-                    if hasattr(cache, "key_cache"):
+                    if hasattr(cache, "get_seq_length"):
+                        # Modern Cache object (DynamicCache in transformers 5.2.0+)
+                        from transformers_inference import _get_cache_seq_length
+                        num_layers = len(cache) if hasattr(cache, "__len__") else 0
+                        seq_len = _get_cache_seq_length(cache)
                         logger.debug(
-                            f"   ✅ Cache exists: {len(cache.key_cache)} layers"
+                            f"   ✅ Cache exists ({type(cache).__name__}): {num_layers} layers, seq_len={seq_len}"
                         )
-                        try:
-                            if hasattr(cache, "get_seq_length"):
-                                seq_len = cache.get_seq_length(0)
-                                logger.debug(f"   Cache seq_len: {seq_len}")
-                            elif len(cache.key_cache) > 0 and cache.key_cache[0] is not None:
-                                logger.debug(f"   Cache seq_len: {cache.key_cache[0].shape[-2]}")
-                            else:
-                                logger.debug("   Cache seq_len: (empty)")
-                        except Exception as e:
-                            logger.debug(f"   Cache seq_len: ERROR ({e})")
-                    else:
+                    elif hasattr(cache, "__len__"):
                         logger.debug(f"   ✅ Cache exists (tuple): {len(cache)} layers")
+                    else:
+                        logger.debug(f"   ✅ Cache exists: {type(cache).__name__}")
                 else:
                     logger.warning("   ⚠️  NO CACHE found on worker node!")
                     logger.warning(

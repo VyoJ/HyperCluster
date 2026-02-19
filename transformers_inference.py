@@ -24,6 +24,13 @@ def _get_cache_seq_length(cache_state) -> int:
     Supports both DynamicCache objects and tuple-based caches.
     Handles sharded models where early cache slots may be empty.
 
+    CRITICAL: In transformers 5.2.0+, DynamicCache uses `.layers` (list of
+    DynamicLayer objects) instead of `.key_cache`/`.value_cache`.  When a shard
+    only owns layers N..M, the cache still uses the *global* layer indices, so
+    layers 0..(N-1) exist in the cache but are **empty**.  The default
+    `cache.get_seq_length()` checks layer 0 and returns 0, which breaks
+    cache_position computation for non-first shards.
+
     Args:
         cache_state: Either a DynamicCache object or tuple of per-layer caches
 
@@ -33,7 +40,7 @@ def _get_cache_seq_length(cache_state) -> int:
     if cache_state is None:
         return 0
 
-    # Check if it's a DynamicCache object
+    # Check if it's a DynamicCache object (or similar Cache subclass)
     if hasattr(cache_state, "get_seq_length"):
         # Try default (layer 0) first
         try:
@@ -43,17 +50,28 @@ def _get_cache_seq_length(cache_state) -> int:
         except Exception:
             pass
 
-        # If layer 0 is empty (e.g. sharded model with offset layers),
-        # find the first non-empty layer
+        # Layer 0 is empty — this happens with sharded models where this
+        # node only owns layers N..M but the cache uses global layer indices.
+        # Scan ALL layers to find one that has data.
+        num_layers = len(cache_state) if hasattr(cache_state, "__len__") else 0
+        for i in range(num_layers):
+            try:
+                seq_len = cache_state.get_seq_length(i)
+                if seq_len > 0:
+                    return seq_len
+            except Exception:
+                continue
+
+        # Fallback for older transformers that still have key_cache attribute
         if hasattr(cache_state, "key_cache"):
             for i, key_tensor in enumerate(cache_state.key_cache):
                 if key_tensor is not None and key_tensor.dim() >= 3:
                     return key_tensor.shape[2]
+
         return 0
 
-    # Check if it has key_cache attribute (DynamicCache alternative method)
+    # Check if it has key_cache attribute (older DynamicCache)
     if hasattr(cache_state, "key_cache") and len(cache_state.key_cache) > 0:
-        # Find first non-empty cache entry
         for key_tensor in cache_state.key_cache:
             if key_tensor is not None and key_tensor.dim() >= 3:
                 return key_tensor.shape[2]
@@ -62,7 +80,6 @@ def _get_cache_seq_length(cache_state) -> int:
     # Fallback: tuple/list of per-layer caches
     if isinstance(cache_state, (list, tuple)) and len(cache_state) > 0:
         if cache_state[0] is not None:
-            # Tuple of (key, value) tensors
             if isinstance(cache_state[0], (list, tuple)) and len(cache_state[0]) > 0:
                 return cache_state[0][0].shape[2]
 
@@ -291,21 +308,13 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                 logger.debug(f"✅ Cache EXISTS for request {request_id}")
                 logger.debug(f"   Cache type: {type(cache_state).__name__}")
 
-                # Inspect cache structure
-                if hasattr(cache_state, "key_cache"):
-                    # DynamicCache or similar
-                    num_cached_layers = len(cache_state.key_cache)
+                # Inspect cache structure — works with both old (key_cache)
+                # and new (layers) DynamicCache API in transformers 5.2.0+
+                if hasattr(cache_state, "get_seq_length"):
+                    # Modern Cache object (DynamicCache, StaticCache, etc.)
+                    num_cached_layers = len(cache_state) if hasattr(cache_state, "__len__") else 0
                     logger.debug(f"   Number of layers in cache: {num_cached_layers}")
                     logger.debug(f"   Sequence length: {past_length}")
-
-                    # Show shape of each cached layer
-                    for i, key_tensor in enumerate(
-                        cache_state.key_cache[: min(3, num_cached_layers)]
-                    ):
-                        if key_tensor is not None:
-                            logger.debug(f"   Layer {i} key shape: {key_tensor.shape}")
-                    if num_cached_layers > 3:
-                        logger.debug(f"   ... and {num_cached_layers - 3} more layers")
 
                     # 🚨 CRITICAL CHECK: Does cache have ALL model layers or just my shard's layers?
                     expected_layers = self.shard.end_layer - self.shard.start_layer + 1
@@ -318,6 +327,10 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                             f"   Expected {expected_layers} layers for my shard OR {self.shard.n_layers} for full model"
                         )
                         logger.warning(f"   Got {num_cached_layers} layers in cache")
+                        logger.warning(
+                            f"   (Note: worker shards use global layer indices, so cache may have "
+                            f"{self.shard.n_layers} slots with only {expected_layers} populated)"
+                        )
                 elif hasattr(cache_state, "__len__"):
                     num_cached_layers = len(cache_state)
                     logger.debug(
@@ -564,8 +577,9 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                     try:
                         if hasattr(outputs.past_key_values, "get_seq_length"):
                             # Modern Cache object (DynamicCache, StaticCache, etc.)
-                            cache_seq_len = outputs.past_key_values.get_seq_length(0)
-                            cache_num_layers = len(outputs.past_key_values)
+                            # Use _get_cache_seq_length for shard-safe seq length
+                            cache_seq_len = _get_cache_seq_length(outputs.past_key_values)
+                            cache_num_layers = len(outputs.past_key_values) if hasattr(outputs.past_key_values, "__len__") else 0
 
                             logger.debug(
                                 f"Cache type: {type(outputs.past_key_values).__name__}"
@@ -585,12 +599,18 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                                     f"✅ Cache matches shard: {cache_num_layers} layers"
                                 )
                             elif cache_num_layers == self.shard.n_layers:
-                                logger.warning(
-                                    f"⚠️  Cache has ALL model layers ({cache_num_layers}), not just shard layers ({expected_shard_layers})"
-                                )
-                                logger.warning(
-                                    "   This might indicate the sharded model wrapper is not filtering correctly!"
-                                )
+                                # Worker shards use global layer indices, so cache has
+                                # n_layers slots but only expected_shard_layers are populated
+                                if self.shard.start_layer > 0:
+                                    logger.debug(
+                                        f"✅ Cache uses global indices: {cache_num_layers} slots "
+                                        f"({expected_shard_layers} populated for layers "
+                                        f"{self.shard.start_layer}-{self.shard.end_layer})"
+                                    )
+                                else:
+                                    logger.debug(
+                                        f"✅ Cache has all model layers: {cache_num_layers}"
+                                    )
                             else:
                                 logger.warning(
                                     f"⚠️  UNEXPECTED cache size: {cache_num_layers} layers"
@@ -599,43 +619,22 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                                     f"   Expected {expected_shard_layers} (shard) or {self.shard.n_layers} (full model)"
                                 )
 
-                            # Show individual layer cache shapes (first 3 and last 1)
-                            if hasattr(outputs.past_key_values, "key_cache"):
-                                logger.debug("Layer-by-layer cache inspection:")
-                                for i in range(min(3, cache_num_layers)):
-                                    k_shape = (
-                                        outputs.past_key_values.key_cache[i].shape
-                                        if outputs.past_key_values.key_cache[i]
-                                        is not None
-                                        else None
-                                    )
-                                    v_shape = (
-                                        outputs.past_key_values.value_cache[i].shape
-                                        if outputs.past_key_values.value_cache[i]
-                                        is not None
-                                        else None
-                                    )
+                            # Show per-layer cache info (using get_seq_length per layer)
+                            logger.debug("Layer-by-layer cache inspection:")
+                            show_layers = list(range(min(3, cache_num_layers)))
+                            if cache_num_layers > 4:
+                                show_layers.append(cache_num_layers - 1)
+                            for i in show_layers:
+                                try:
+                                    layer_seq = outputs.past_key_values.get_seq_length(i)
+                                    status = "populated" if layer_seq > 0 else "empty"
                                     logger.debug(
-                                        f"   Layer {i}: K={k_shape}, V={v_shape}"
+                                        f"   Layer {i}: seq_len={layer_seq} ({status})"
                                     )
-                                if cache_num_layers > 4:
-                                    i = cache_num_layers - 1
-                                    k_shape = (
-                                        outputs.past_key_values.key_cache[i].shape
-                                        if outputs.past_key_values.key_cache[i]
-                                        is not None
-                                        else None
-                                    )
-                                    v_shape = (
-                                        outputs.past_key_values.value_cache[i].shape
-                                        if outputs.past_key_values.value_cache[i]
-                                        is not None
-                                        else None
-                                    )
-                                    logger.debug("   ...")
-                                    logger.debug(
-                                        f"   Layer {i}: K={k_shape}, V={v_shape}"
-                                    )
+                                except Exception:
+                                    logger.debug(f"   Layer {i}: (error reading)")
+                            if cache_num_layers > 4:
+                                logger.debug(f"   ... ({cache_num_layers - len(show_layers)} layers omitted)")
                         else:
                             # Legacy tuple format
                             cache_seq_len = (
