@@ -100,6 +100,24 @@ class RingPipelineCoordinator:
         self.prefetch_queue = asyncio.Queue()
         self.prefetch_task: Optional[asyncio.Task] = None
 
+    def _my_shard(self, base_shard: Shard) -> Shard:
+        """Return a shard matching this node's layer window.
+
+        The inference engine is loaded with exactly the layers in our
+        ``layer_window``.  Every call to ``ensure_shard`` / ``infer_tensor``
+        must receive this *node-local* shard so the engine does NOT
+        reload the model.  The ``base_shard`` (full model) is only used
+        for ``n_layers`` / ``model_id`` metadata.
+        """
+        if self.layer_window is None:
+            return base_shard
+        return Shard(
+            model_id=base_shard.model_id,
+            start_layer=self.layer_window.layer_start,
+            end_layer=self.layer_window.layer_end,
+            n_layers=base_shard.n_layers,
+        )
+
     async def initialize_ring(
         self,
         topology_nodes: List[Tuple[str, Any]],
@@ -351,7 +369,7 @@ class RingPipelineCoordinator:
         # Encode prompt
         stats_logger.log_encoding_start(request_id)
         start_time = time.time()
-        tokens = await self.inference_engine.encode(shard, prompt)
+        tokens = await self.inference_engine.encode(self._my_shard(shard), prompt)
         input_tokens = tokens.reshape(1, -1)
         encode_time = time.time() - start_time
         stats_logger.log_encoding_end(request_id, len(tokens))
@@ -731,7 +749,7 @@ class RingPipelineCoordinator:
             # Run inference on assigned layers using the already-loaded sharded model
             output_data, new_state = await self.inference_engine.infer_tensor(
                 request_id=request_id,
-                shard=shard,  # Use base shard, inference engine has correct shard loaded
+                shard=self._my_shard(shard),  # Node-local shard matching loaded layers
                 input_data=current_data,
                 inference_state=state.metadata,
                 position_ids=state.position_ids,  # Pass position_ids to inference
