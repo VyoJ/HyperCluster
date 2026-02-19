@@ -607,9 +607,8 @@ class TransformersShard:
             layer_kwargs = {
                 "hidden_states": hidden_states,
                 "attention_mask": causal_mask,
-                # CRITICAL: Qwen3 layer signature expects `past_key_value` (singular)
-                # not `past_key_values` (plural) - see layer forward signature
-                "past_key_value": past_key_value,
+                # Modern transformers (Llama, Qwen2, Qwen3) all use "past_key_values" (plural)
+                "past_key_values": past_key_value,
                 "output_attentions": output_attentions,
                 "use_cache": use_cache,
             }
@@ -630,10 +629,10 @@ class TransformersShard:
                     f"   🔍 CRITICAL: use_cache value being passed: {layer_kwargs['use_cache']}"
                 )
                 logger.debug(
-                    f"   🔍 CRITICAL: past_key_value type: {type(layer_kwargs['past_key_value'])}"
+                    f"   🔍 CRITICAL: past_key_values type: {type(layer_kwargs['past_key_values'])}"
                 )
                 logger.debug(
-                    f"   🔍 CRITICAL: past_key_value value: {layer_kwargs['past_key_value']}"
+                    f"   🔍 CRITICAL: past_key_values value: {layer_kwargs['past_key_values']}"
                 )
                 # CRITICAL: Inspect the actual layer forward signature
                 import inspect
