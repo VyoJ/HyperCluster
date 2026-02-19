@@ -818,6 +818,35 @@ class LLMService:
                 model_total_layers=self.current_shard.n_layers,
             )
 
+        # CRITICAL: Re-shard the model to match the ring layer assignment.
+        # At startup the model is loaded with all layers (e.g., 0-27/28).
+        # The ring assigns only a subset to this node (e.g., 0-17 for HEAD,
+        # 18-27 for WORKER).  Without reloading, the model still executes ALL
+        # 28 layers, making the ring topology meaningless and causing garbage.
+        if self.ring_coordinator.layer_window and self.inference_engine:
+            new_shard = Shard(
+                model_id=self.base_shard.model_id,
+                start_layer=self.ring_coordinator.layer_window.layer_start,
+                end_layer=self.ring_coordinator.layer_window.layer_end,
+                n_layers=self.base_shard.n_layers,
+            )
+
+            if self.current_shard != new_shard:
+                logger.info(
+                    f"🔄 Re-sharding model for ring: {self.current_shard} → {new_shard}"
+                )
+                logger.info(
+                    f"   Loading only layers {new_shard.start_layer}-{new_shard.end_layer} "
+                    f"out of {new_shard.n_layers} total"
+                )
+                self.current_shard = new_shard
+                await self.inference_engine.ensure_shard(
+                    new_shard, force_reload=True
+                )
+                logger.info("✅ Model re-sharded for ring pipeline")
+            else:
+                logger.info("Shard already matches ring assignment, no reload needed")
+
     async def on_topology_update(self):
         """Handle topology updates - re-initialize ring if nodes join/leave."""
         if not self.use_ring or not self.ring_coordinator or not self.is_running:
