@@ -502,37 +502,19 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                         f"Hidden size mismatch: expected {inference_state['hidden_size']}, got {hidden_size}"
                     )
 
-                # CRITICAL: Non-first shards also need position_ids and attention_mask!
-                # Prima.cpp passes inp_pos to ALL nodes, not just the first one.
-                inputs = {
-                    "inputs_embeds": input_tensor,
-                    "past_key_values": cache_state,
-                    "use_cache": True,
-                    "apply_lm_head": is_final,  # Only apply LM head if this completes all layers
-                }
+                # CRITICAL FIX: When using cache_position (modern transformers 4.36+),
+                # DO NOT pass position_ids or attention_mask — let the model
+                # compute them internally from cache_position + past_key_values.
+                # This matches the first-shard behavior (see above).
+                #
+                # Previously we passed the ring's attention_mask here, but during
+                # autoregressive generation it has shape (1, 1) — only covering the
+                # NEW token.  create_causal_mask then builds a mask that doesn't
+                # attend to cached tokens, causing broken attention & garbage output.
+                # Omitting it lets create_causal_mask derive the full mask from the
+                # cache state, which is correct.
 
-                # Add position_ids if provided (CRITICAL for RoPE in middle layers)
-                if position_ids is not None:
-                    position_ids_tensor = (
-                        torch.from_numpy(position_ids).long().to(device)
-                    )
-                    inputs["position_ids"] = position_ids_tensor
-                    logger.debug(
-                        f"Non-first shard using position_ids: {position_ids_tensor.shape}"
-                    )
-
-                # Add attention_mask if provided
-                if attention_mask is not None:
-                    attention_mask_tensor = (
-                        torch.from_numpy(attention_mask).bool().to(device)
-                    )
-                    inputs["attention_mask"] = attention_mask_tensor
-                    logger.debug(
-                        f"Non-first shard using attention_mask: {attention_mask_tensor.shape}"
-                    )
-
-                # CRITICAL: Add cache_position for middle/last shards too
-                # This is needed for the layers to properly update KV cache
+                # Build cache_position first (needed for inputs dict)
                 past_length = _get_cache_seq_length(cache_state)
                 if past_length > 0:
                     cache_position = torch.arange(
@@ -541,18 +523,24 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                         dtype=torch.long,
                         device=device,
                     )
-                    inputs["cache_position"] = cache_position
-                    logger.debug(
-                        f"🎯 Non-first shard cache_position: {cache_position.tolist()}"
-                    )
                 else:
                     cache_position = torch.arange(
                         seq_len, dtype=torch.long, device=device
                     )
-                    inputs["cache_position"] = cache_position
-                    logger.debug(
-                        f"🎯 Non-first shard cache_position: {cache_position.tolist()} (new cache)"
-                    )
+
+                inputs = {
+                    "inputs_embeds": input_tensor,
+                    # attention_mask NOT included — let model compute internally
+                    # position_ids NOT included — computed from cache_position internally
+                    "past_key_values": cache_state,
+                    "use_cache": True,
+                    "cache_position": cache_position,
+                    "apply_lm_head": is_final,  # Only apply LM head if this completes all layers
+                }
+                logger.debug(
+                    f"🔧 Non-first shard: using cache_position={cache_position.tolist()}, "
+                    f"letting model compute position_ids and attention_mask internally"
+                )
 
             # Run inference
             with torch.no_grad():
