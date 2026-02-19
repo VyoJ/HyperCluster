@@ -478,7 +478,7 @@ class RingPipelineCoordinator:
             if (step + 1) % 10 == 0 or step == 0:
                 try:
                     decoded_so_far = await self.inference_engine.decode(
-                        shard, np.array(generated_tokens)
+                        self._my_shard(shard), np.array(generated_tokens)
                     )
                     logger.debug(
                         f"   📝 Text so far: {decoded_so_far[:100]}{'...' if len(decoded_so_far) > 100 else ''}"
@@ -516,7 +516,7 @@ class RingPipelineCoordinator:
         # Decode the generated tokens to text
         try:
             decoded_text = await self.inference_engine.decode(
-                shard, np.array(generated_tokens)
+                self._my_shard(shard), np.array(generated_tokens)
             )
         except Exception as e:
             logger.error(f"Error decoding tokens: {e}")
