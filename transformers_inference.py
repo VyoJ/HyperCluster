@@ -709,8 +709,16 @@ class TransformersShardedInferenceEngine(InferenceEngine):
             # Reload if:
             # 1. No shard loaded yet
             # 2. Different model_id
-            # 3. Force reload requested (e.g., topology update changed shard assignment)
-            if self.shard is None or self.shard.model_id != shard.model_id or force_reload:
+            # 3. Different layer range (shard assignment changed)
+            # 4. Force reload requested (e.g., topology update changed shard assignment)
+            needs_reload = (
+                self.shard is None
+                or self.shard.model_id != shard.model_id
+                or self.shard.start_layer != shard.start_layer
+                or self.shard.end_layer != shard.end_layer
+                or force_reload
+            )
+            if needs_reload:
                 logger.info(
                     f"Loading shard: {shard} "
                     f"(previous: {self.shard}, force={force_reload})"
@@ -722,18 +730,33 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                 self.caches.clear()
                 self.session.clear()
             else:
-                # Same model, different layer spec - don't reload
-                # This happens when ring pipeline passes base_shard
-                # but node already has current_shard loaded
+                # Same model and layer range but different n_layers — no reload needed
                 logger.debug(
-                    f"Shard spec changed but same model_id, keeping loaded shard: "
+                    f"Shard metadata changed (n_layers), keeping loaded shard: "
                     f"loaded={self.shard}, requested={shard}"
                 )
+                self.shard = shard
 
     async def _load_shard(self, model_id: str, shard: Shard):
-        """Load model shard and tokenizer."""
+        """Load model shard and tokenizer.
+
+        Uses selective layer loading: creates an empty model skeleton on the
+        ``meta`` device (zero memory), then loads *only* the safetensors
+        weights needed for this shard directly from disk.  Unneeded layers
+        stay as zero-byte ``meta`` tensors and are never materialised.
+
+        This is dramatically more memory-efficient than the old approach of
+        loading the full model and then freeing unneeded layers, especially
+        for large models where the full checkpoint may not fit in RAM.
+        """
 
         def _load():
+            import json
+            import os
+
+            from accelerate import init_empty_weights
+            from accelerate.utils import set_module_tensor_to_device
+            from safetensors import safe_open
             from transformers import AutoConfig, AutoModelForCausalLM
 
             logger.info(f"🔧 Loading shard {shard} for model {model_id}")
@@ -749,25 +772,105 @@ class TransformersShardedInferenceEngine(InferenceEngine):
             logger.info(f"   Num layers: {config.num_hidden_layers}")
             logger.info(f"   Vocab size: {config.vocab_size}")
 
-            # Get device and dtype configuration
-            device_map = self._create_device_map_for_shard(shard)
             torch_dtype = self._get_torch_dtype()
 
-            # Load model with appropriate configuration
-            model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                config=config,
-                cache_dir=self.cache_dir,
-                device_map=device_map,
-                torch_dtype=torch_dtype,
-                low_cpu_mem_usage=True,
-                trust_remote_code=True,
+            # ── Step 1: Create empty model skeleton (0 bytes) ──────────
+            with init_empty_weights():
+                model = AutoModelForCausalLM.from_config(
+                    config, dtype=torch_dtype, trust_remote_code=True,
+                )
+
+            # ── Step 2: Resolve snapshot directory on disk ─────────────
+            try:
+                from huggingface_hub import snapshot_download
+
+                snap_dir = snapshot_download(
+                    model_id, cache_dir=self.cache_dir, local_files_only=True,
+                )
+            except Exception:
+                # Fallback: try to find it manually
+                safe_model_id = model_id.replace("/", "--")
+                cache_root = os.path.join(self.cache_dir, f"models--{safe_model_id}")
+                refs_path = os.path.join(cache_root, "refs", "main")
+                if os.path.exists(refs_path):
+                    with open(refs_path) as f:
+                        commit_hash = f.read().strip()
+                    snap_dir = os.path.join(cache_root, "snapshots", commit_hash)
+                else:
+                    raise FileNotFoundError(
+                        f"Cannot resolve snapshot directory for {model_id} in {self.cache_dir}"
+                    )
+
+            logger.info(f"📂 Snapshot directory: {snap_dir}")
+
+            # ── Step 3: Determine needed weight keys ───────────────────
+            needed_prefixes = []
+            for i in range(shard.start_layer, shard.end_layer + 1):
+                needed_prefixes.append(f"model.layers.{i}.")
+
+            if shard.is_first_layer():
+                needed_prefixes.append("model.embed_tokens.")
+            if shard.is_last_layer():
+                needed_prefixes.append("model.norm.")
+                needed_prefixes.append("lm_head.")
+
+            # rotary_emb weights (if stored — most models compute them at
+            # runtime, but check just in case)
+            needed_prefixes.append("model.rotary_emb.")
+
+            # ── Step 4: Build file→keys mapping ───────────────────────
+            index_path = os.path.join(snap_dir, "model.safetensors.index.json")
+            if os.path.exists(index_path):
+                # Multi-file model (e.g., Llama-3.2-3B)
+                with open(index_path) as f:
+                    weight_map = json.load(f)["weight_map"]
+                file_to_keys: dict[str, list[str]] = {}
+                for key, fname in weight_map.items():
+                    if any(key.startswith(p) for p in needed_prefixes):
+                        file_to_keys.setdefault(fname, []).append(key)
+                total_keys = len(weight_map)
+            else:
+                # Single-file model (e.g., Qwen3-0.6B)
+                st_path = os.path.join(snap_dir, "model.safetensors")
+                with safe_open(st_path, framework="pt") as f:
+                    all_keys = list(f.keys())
+                total_keys = len(all_keys)
+                needed_keys = [
+                    k for k in all_keys
+                    if any(k.startswith(p) for p in needed_prefixes)
+                ]
+                file_to_keys = {"model.safetensors": needed_keys}
+
+            needed_count = sum(len(v) for v in file_to_keys.values())
+            skipped_count = total_keys - needed_count
+            logger.info(
+                f"📦 Selective loading: {needed_count}/{total_keys} tensors "
+                f"(skipping {skipped_count} unneeded)"
             )
 
-            # Wrap model in shard wrapper
-            model = self._wrap_model_in_shard(model, shard)
+            # ── Step 5: Load only the needed tensors ───────────────────
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            loaded = 0
+            import time as _time
+            t0 = _time.time()
 
-            # Set to eval mode
+            for fname, keys in file_to_keys.items():
+                filepath = os.path.join(snap_dir, fname)
+                with safe_open(filepath, framework="pt", device="cpu") as f:
+                    for key in keys:
+                        tensor = f.get_tensor(key)
+                        if tensor.dtype != torch_dtype:
+                            tensor = tensor.to(torch_dtype)
+                        set_module_tensor_to_device(model, key, device, value=tensor)
+                        loaded += 1
+
+            load_time = _time.time() - t0
+            logger.info(
+                f"✅ Loaded {loaded} tensors to {device} in {load_time:.2f}s"
+            )
+
+            # ── Step 6: Wrap in shard wrapper ──────────────────────────
+            model = self._wrap_model_in_shard(model, shard)
             model.eval()
 
             logger.info(f"Successfully loaded shard {shard}")
@@ -796,21 +899,25 @@ class TransformersShardedInferenceEngine(InferenceEngine):
 
     def _wrap_model_in_shard(self, model, shard: Shard):
         """
-        Wrap model to only execute assigned layers and free unneeded layers.
+        Wrap model to only execute assigned layers.
 
         Uses the TransformersShard wrapper to extract and execute only
-        the layers assigned to this shard. After wrapping, frees all
-        unneeded layers from memory so only the assigned layers remain.
+        the layers assigned to this shard.
+
+        Note: With selective loading, unneeded layers are already on the
+        ``meta`` device (0 bytes) so ``free_unneeded_layers()`` is
+        unnecessary.  We still call it as a safety net — it handles the
+        case where a layer is already ``None`` or on ``meta`` gracefully.
         """
         from sharded_model import TransformersShard
 
         logger.info(f"Wrapping model in shard: {shard}")
         sharded = TransformersShard(model, shard)
-        
-        # Free unneeded layers to reduce memory usage
-        # This is critical for large models that don't fit on one device
+
+        # Safety net: free any layers that might still be materialised
+        # (e.g. if the model was loaded via from_pretrained fallback).
         sharded.free_unneeded_layers()
-        
+
         return sharded
 
     def _create_device_map_for_shard(self, shard: Shard) -> Union[str, Dict[str, Any]]:
