@@ -679,7 +679,14 @@ class TransformersShard:
                     layer_outputs = layer(hidden_states, attention_mask=attention_mask)
 
             # Extract outputs
-            if isinstance(layer_outputs, tuple):
+            if isinstance(layer_outputs, torch.Tensor):
+                # Modern transformers (4.45+) return a raw Tensor when
+                # output_attentions=False.  The tensor IS the hidden_states.
+                # CRITICAL: Do NOT index into it (layer_outputs[0] would slice
+                # the batch dimension, turning (B, S, H) into (S, H) and
+                # corrupting all subsequent layers).
+                hidden_states = layer_outputs
+            elif isinstance(layer_outputs, tuple):
                 hidden_states = layer_outputs[0]
 
                 # CRITICAL FIX: Modern transformers (4.36+) don't return cache in layer outputs!
