@@ -802,9 +802,22 @@ class TransformersShardedInferenceEngine(InferenceEngine):
             torch_dtype = self._get_torch_dtype()
 
             # ── Step 1: Create empty model skeleton (0 bytes) ──────────
+            # CRITICAL: Set _attn_implementation explicitly.
+            # from_pretrained() auto-detects SDPA support and sets this,
+            # but from_config() does NOT — it defaults to "eager", which
+            # can produce different (and sometimes incorrect) attention
+            # behaviour compared to from_pretrained().
+            try:
+                attn_impl = "sdpa" if hasattr(torch.nn.functional, "scaled_dot_product_attention") else "eager"
+            except Exception:
+                attn_impl = "eager"
+            config._attn_implementation = attn_impl
+            logger.info(f"   Attention impl: {attn_impl}")
+
             with init_empty_weights():
                 model = AutoModelForCausalLM.from_config(
                     config, dtype=torch_dtype, trust_remote_code=True,
+                    attn_implementation=attn_impl,
                 )
 
             # ── Step 2: Resolve snapshot directory on disk ─────────────
@@ -895,6 +908,66 @@ class TransformersShardedInferenceEngine(InferenceEngine):
             logger.info(
                 f"✅ Loaded {loaded} tensors to {device} in {load_time:.2f}s"
             )
+
+            # ── Step 5b: Handle weight-tied lm_head ───────────────────
+            # Many models (Llama 3.2-1B, Qwen3-0.6B, etc.) set
+            # config.tie_word_embeddings=True, which means lm_head.weight
+            # is shared with model.embed_tokens.weight.  The safetensors
+            # file does NOT store a separate "lm_head.weight" key in this
+            # case — the weight is implied by the tie.
+            #
+            # However, set_module_tensor_to_device() replaces the
+            # embed_tokens parameter *without* re-tying it to lm_head,
+            # leaving lm_head.weight on the meta device (all zeros).
+            # This causes ALL logits to be zero → random/gibberish output.
+            #
+            # Fix: After loading, explicitly re-tie the weights.
+            tie_weights = getattr(config, "tie_word_embeddings", False)
+            if tie_weights and shard.is_last_layer():
+                embed_param = None
+                # Get the embed_tokens parameter (already loaded if first shard)
+                if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
+                    embed_param = model.model.embed_tokens.weight
+                elif hasattr(model, "transformer") and hasattr(model.transformer, "wte"):
+                    embed_param = model.transformer.wte.weight
+
+                if embed_param is not None and embed_param.device.type != "meta":
+                    # embed_tokens was loaded (first shard) — tie lm_head to it
+                    lm_head = getattr(model, "lm_head", None)
+                    if lm_head is not None and lm_head.weight.device.type == "meta":
+                        lm_head.weight = embed_param
+                        logger.info(
+                            "🔗 Tied lm_head.weight → embed_tokens.weight "
+                            f"(tie_word_embeddings=True, shape={embed_param.shape})"
+                        )
+                elif not shard.is_first_layer():
+                    # Last shard but NOT first — embed_tokens wasn't loaded.
+                    # We need the embedding weights for the LM head.
+                    logger.info(
+                        "🔗 Loading embed_tokens.weight for tied lm_head "
+                        "(last shard without first shard)"
+                    )
+                    embed_key = "model.embed_tokens.weight"
+                    # Search all files for the embed key
+                    if os.path.exists(index_path):
+                        embed_fname = weight_map.get(embed_key)
+                    else:
+                        embed_fname = "model.safetensors"
+                    if embed_fname:
+                        filepath = os.path.join(snap_dir, embed_fname)
+                        with safe_open(filepath, framework="pt", device="cpu") as f:
+                            if embed_key in f.keys():
+                                tensor = f.get_tensor(embed_key)
+                                if tensor.dtype != torch_dtype:
+                                    tensor = tensor.to(torch_dtype)
+                                tensor = tensor.to(device)
+                                # Set it directly on lm_head
+                                model.lm_head.weight = torch.nn.Parameter(tensor)
+                                loaded += 1
+                                logger.info(
+                                    f"✅ Loaded embed_tokens as lm_head.weight "
+                                    f"(shape={tensor.shape})"
+                                )
 
             # ── Step 6: Wrap in shard wrapper ──────────────────────────
             model = self._wrap_model_in_shard(model, shard)

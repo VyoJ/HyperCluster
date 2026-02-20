@@ -325,8 +325,11 @@ class RingPipelineCoordinator:
         if not self.layer_window:
             return 1
 
-        # Sum of all layer windows
-        total_window = self.layer_window.layer_end + 1
+        # Total layers covered by all nodes in the ring.
+        # The ring distributes ALL model layers across nodes, so one
+        # full trip around the ring processes total_layers layers.
+        # Cycles > 1 would only occur if the ring didn't cover all layers.
+        total_window = self.layer_window.total_layers  # == total_layers when fully covered
 
         # Cycles = ceil(total_layers / total_window)
         cycles = (total_layers + total_window - 1) // total_window

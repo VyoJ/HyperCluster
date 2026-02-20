@@ -835,7 +835,7 @@ class Node:
                 sender_id=sender_id,
                 request_id=request_id,
                 tensor_data=tensor,
-                shard=llm_service.current_shard,
+                shard=llm_service.base_shard,  # Full model spec, NOT node-local shard
                 is_final=is_final,
                 position_ids=position_ids,  # CRITICAL: Pass position info for RoPE
                 attention_mask=attention_mask,  # CRITICAL: Pass attention mask

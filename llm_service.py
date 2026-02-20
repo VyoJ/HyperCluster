@@ -544,12 +544,22 @@ class LLMService:
 
         if self.current_shard:
             logger.info(f"Node assigned shard: {self.current_shard}")
-            logger.info(
-                f"Loading only layers {self.current_shard.start_layer}-{self.current_shard.end_layer} "
-                f"out of {num_layers} total layers"
-            )
-            # Load only the assigned shard layers (unneeded layers freed automatically)
-            await self.inference_engine.ensure_shard(self.current_shard)
+
+            if self.use_ring:
+                # In ring mode, defer model loading until _init_ring_pipeline()
+                # discovers peers and assigns the correct layer window.
+                # Loading now would load ALL layers (only 1 node in topology yet)
+                # which is wasteful — the ring will immediately re-shard.
+                logger.info(
+                    "⏳ Ring mode: deferring model load until ring assigns layers"
+                )
+            else:
+                logger.info(
+                    f"Loading only layers {self.current_shard.start_layer}-{self.current_shard.end_layer} "
+                    f"out of {num_layers} total layers"
+                )
+                # Load only the assigned shard layers (unneeded layers freed automatically)
+                await self.inference_engine.ensure_shard(self.current_shard)
         else:
             logger.warning("No shard assigned to this node")
 
@@ -764,7 +774,7 @@ class LLMService:
                         sender_id=sender_id,
                         request_id=request_id,
                         tensor_data=tensor_data,
-                        shard=self.current_shard,
+                        shard=self.base_shard,  # Full model spec, NOT node-local shard
                         is_final=is_final,
                         position_ids=position_ids,
                         attention_mask=attention_mask,
