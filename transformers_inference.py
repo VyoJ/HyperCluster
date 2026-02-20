@@ -131,9 +131,36 @@ class TransformersShardedInferenceEngine(InferenceEngine):
             self._tokenizer_thread, func, *args, **kwargs
         )
 
+    async def _ensure_tokenizer(self, model_id: str):
+        """Ensure the tokenizer is loaded for the given model.
+
+        Unlike ``ensure_shard``, this does NOT touch the model weights at all.
+        ``encode`` and ``decode`` only need the tokenizer, so calling
+        ``ensure_shard`` from those methods is wasteful and actively harmful
+        in ring-pipeline mode — it compares shard layer ranges and triggers
+        a full model reload even though the tokenizer is already available.
+        """
+        if self.tokenizer is not None:
+            return
+
+        def _load_tokenizer():
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_id,
+                cache_dir=self.cache_dir,
+                trust_remote_code=True,
+                use_fast=False,
+            )
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            return tokenizer
+
+        self.tokenizer = await self._run_in_tokenizer_thread(_load_tokenizer)
+
     async def encode(self, shard: Shard, prompt: str) -> np.ndarray:
         """Encode text prompt to token IDs using chat template."""
-        await self.ensure_shard(shard)
+        await self._ensure_tokenizer(shard.model_id)
 
         def _encode():
             # Use chat template for proper formatting with control tokens
@@ -159,7 +186,7 @@ class TransformersShardedInferenceEngine(InferenceEngine):
 
     async def decode(self, shard: Shard, tokens: np.ndarray) -> str:
         """Decode token IDs to text."""
-        await self.ensure_shard(shard)
+        await self._ensure_tokenizer(shard.model_id)
 
         def _decode():
             # Handle both single token and arrays
