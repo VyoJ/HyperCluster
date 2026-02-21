@@ -336,7 +336,7 @@ class RingPipelineCoordinator:
         return cycles
 
     async def start_inference(
-        self, request_id: str, prompt: str, shard: Shard, max_tokens: int = 50
+        self, request_id: str, prompt: str, shard: Shard, max_tokens: int = 512
     ) -> List[int]:
         """
         Start ring pipeline inference (head node only).
@@ -388,6 +388,7 @@ class RingPipelineCoordinator:
 
         # Start inference timing
         stats_logger.log_inference_start(request_id)
+        inference_start_time = time.time()
 
         # Auto-regressive generation loop
         for step in range(max_tokens):
@@ -515,6 +516,7 @@ class RingPipelineCoordinator:
         stats_logger.log_inference_end(request_id)
 
         total_time = time.time() - start_time
+        inference_time = time.time() - inference_start_time
 
         # Decode the generated tokens to text
         try:
@@ -528,9 +530,12 @@ class RingPipelineCoordinator:
         logger.debug("=" * 80)
         logger.info("✨ GENERATION COMPLETE")
         logger.info(f"   Total tokens: {len(generated_tokens)}")
-        logger.info(f"   Total time: {total_time:.2f}s")
+        logger.info(f"   Inference time: {inference_time:.2f}s (end-to-end: {total_time:.2f}s)")
+        logger.info(
+            f"   Tokens/sec: {len(generated_tokens) / max(inference_time, 0.001):.2f}"
+        )
         logger.debug(
-            f"   Avg token latency: {total_time / max(len(generated_tokens), 1) * 1000:.1f}ms/token"
+            f"   Avg token latency: {inference_time / max(len(generated_tokens), 1) * 1000:.1f}ms/token"
         )
         logger.debug("=" * 80)
         logger.debug("")

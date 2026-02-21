@@ -229,14 +229,28 @@ class StatsLogger:
         prompt_tokens = gen.get("prompt_tokens", 0)
         generated_tokens = len(generated_token_ids)
         total_tokens = prompt_tokens + generated_tokens
-        tps = generated_tokens / total_time_s if total_time_s > 0 else 0.0
 
-        # Calculate TTFT
+        # TPS should be based on *inference time only*, not total wall time.
+        # total_time_s includes model loading, tokenizer init, encoding, etc.
+        # which dramatically under-reports actual generation speed.
+        inference_start = gen.get("inference_start")
+        inference_end = gen.get("inference_end")
+        if inference_start and inference_end:
+            inference_duration = inference_end - inference_start
+        else:
+            inference_duration = total_time_s  # fallback to total if not tracked
+
+        tps = generated_tokens / inference_duration if inference_duration > 0 else 0.0
+
+        # Calculate TTFT relative to inference start (not overall start which
+        # includes model loading).  If inference_start is not tracked, fall
+        # back to the overall start_time.
         ttft_ms = None
         if gen["first_token_time"]:
-            ttft_ms = (gen["first_token_time"] - gen["start_time"]) * 1000
+            ttft_base = inference_start if inference_start else gen["start_time"]
+            ttft_ms = (gen["first_token_time"] - ttft_base) * 1000
 
-        # Calculate average time per token (excluding first token)
+        # Calculate average time per token (excluding first token / prefill)
         avg_time_per_token_ms = 0.0
         if len(gen["step_times"]) > 1:
             avg_time_per_token_ms = sum(gen["step_times"][1:]) / len(
@@ -324,8 +338,10 @@ class StatsLogger:
         logger.info(f"  Total tokens: {stats.tokens.total_tokens}")
         logger.info("")
         logger.info("⚡ Performance:")
-        logger.info(f"  Total time: {stats.timing.total_time_s:.3f}s")
-        logger.info(f"  Tokens/sec: {stats.tokens.tokens_per_second:.2f}")
+        logger.info(f"  Total time (end-to-end): {stats.timing.total_time_s:.3f}s")
+        if stats.timing.inference_time_ms:
+            logger.info(f"  Inference time: {stats.timing.inference_time_ms / 1000:.3f}s")
+        logger.info(f"  Tokens/sec (inference): {stats.tokens.tokens_per_second:.2f}")
         if stats.tokens.time_to_first_token_ms:
             logger.info(f"  TTFT: {stats.tokens.time_to_first_token_ms:.1f}ms")
         logger.info(f"  Avg time/token: {stats.tokens.avg_time_per_token_ms:.1f}ms")

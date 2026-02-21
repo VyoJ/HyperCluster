@@ -821,47 +821,74 @@ class TransformersShardedInferenceEngine(InferenceEngine):
                 )
 
             # ── Step 2: Resolve snapshot directory on disk ─────────────
-            # First, try to download/ensure all model files are present.
-            # If the config was fetched earlier (e.g. by AutoConfig) but
-            # the actual weight files weren't downloaded yet, a
-            # local_files_only=True call would find the snapshot dir but
-            # the safetensors weights would be missing.  So we attempt a
-            # full download first and only fall back to local-only on
-            # network errors.
+            # Strategy: try local cache first (fast, no network).  If the
+            # snapshot dir exists but the actual weight files are missing
+            # (e.g. only config/tokenizer were fetched by AutoConfig),
+            # download *only* the safetensors weights — NOT the entire
+            # repo (which would pull multi-GB .pth originals too).
             from huggingface_hub import snapshot_download
 
+            snap_dir = None
+
+            # 2a. Try local-only first (instant, no network)
             try:
                 snap_dir = snapshot_download(
                     model_id, cache_dir=self.cache_dir,
+                    local_files_only=True,
                 )
-            except Exception as e:
-                logger.warning(
-                    f"⚠️  Online snapshot_download failed ({e}), "
-                    f"trying local cache..."
+            except Exception:
+                snap_dir = None
+
+            # If local lookup failed entirely, resolve manually
+            if snap_dir is None:
+                safe_model_id = model_id.replace("/", "--")
+                cache_root = os.path.join(
+                    self.cache_dir, f"models--{safe_model_id}"
+                )
+                refs_path = os.path.join(cache_root, "refs", "main")
+                if os.path.exists(refs_path):
+                    with open(refs_path) as f:
+                        commit_hash = f.read().strip()
+                    snap_dir = os.path.join(
+                        cache_root, "snapshots", commit_hash
+                    )
+
+            # 2b. Check if weight files actually exist in snap_dir
+            has_weights = False
+            if snap_dir and os.path.isdir(snap_dir):
+                has_weights = (
+                    os.path.exists(os.path.join(snap_dir, "model.safetensors"))
+                    or os.path.exists(
+                        os.path.join(snap_dir, "model.safetensors.index.json")
+                    )
+                )
+
+            # 2c. If weights are missing, download only safetensors files
+            if not has_weights:
+                logger.info(
+                    "📥 Weight files not found locally, downloading "
+                    "safetensors weights..."
                 )
                 try:
                     snap_dir = snapshot_download(
-                        model_id, cache_dir=self.cache_dir,
-                        local_files_only=True,
+                        model_id,
+                        cache_dir=self.cache_dir,
+                        allow_patterns=[
+                            "*.safetensors",
+                            "*.safetensors.index.json",
+                            "config.json",
+                        ],
                     )
-                except Exception:
-                    # Last resort: resolve manually
-                    safe_model_id = model_id.replace("/", "--")
-                    cache_root = os.path.join(
-                        self.cache_dir, f"models--{safe_model_id}"
+                except Exception as e:
+                    raise FileNotFoundError(
+                        f"Cannot download model weights for {model_id}: {e}"
                     )
-                    refs_path = os.path.join(cache_root, "refs", "main")
-                    if os.path.exists(refs_path):
-                        with open(refs_path) as f:
-                            commit_hash = f.read().strip()
-                        snap_dir = os.path.join(
-                            cache_root, "snapshots", commit_hash
-                        )
-                    else:
-                        raise FileNotFoundError(
-                            f"Cannot resolve snapshot directory for "
-                            f"{model_id} in {self.cache_dir}"
-                        )
+
+            if not snap_dir or not os.path.isdir(snap_dir):
+                raise FileNotFoundError(
+                    f"Cannot resolve snapshot directory for "
+                    f"{model_id} in {self.cache_dir}"
+                )
 
             logger.info(f"📂 Snapshot directory: {snap_dir}")
 

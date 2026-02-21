@@ -61,7 +61,7 @@ class LLMService:
         self.is_bitnet = "bitnet" in model_name.lower()
 
         # Distributed inference state
-        self.max_generate_tokens = 50
+        self.max_generate_tokens = 512
         self.default_sample_temperature = 0.7
 
         # Stats logger for generation metrics
@@ -296,7 +296,7 @@ class LLMService:
                 request_id=query_id,
                 prompt=query,
                 query_id=query_id,
-                max_tokens=100,  # Default for single-node mode
+                max_tokens=512,  # Default for single-node mode
                 temperature=0.7,
             )
             
